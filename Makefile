@@ -66,18 +66,18 @@ $(OUT):
 $(RES): resource.rc | $(OUT)
 	$(WINDRES) resource.rc -O coff -o $(RES)
 
-$(TUI): main.cpp opencode_data.cpp session_view.cpp opencode_data.hpp session_view.hpp $(RES) | $(OUT)
+$(TUI): main.cpp opencode_data.cpp session_view.cpp db_maintenance.cpp *.hpp $(RES) | $(OUT)
 	$(CXX) $(CXXFLAGS) -static -DNCURSES_WIDECHAR $(INCS) \
 	    main.cpp opencode_data.cpp session_view.cpp $(RES) $(LIBDIR) -lncursesw -lsqlite3 $(LIBS_WIN) -o $(TUI)
 
-$(GUI): main_gui.cpp opencode_data.cpp session_view.cpp opencode_data.hpp session_view.hpp $(IMGUI_SRC) $(RES) | $(OUT)
+$(GUI): main_gui.cpp opencode_data.cpp session_view.cpp db_maintenance.cpp *.hpp $(IMGUI_SRC) $(RES) | $(OUT)
 	$(CXX) $(CXXFLAGS) -static $(INCS) \
 	    main_gui.cpp opencode_data.cpp session_view.cpp $(IMGUI_SRC) $(RES) $(LIBDIR) \
 	    -lsqlite3 -lopengl32 -ldwmapi -lgdi32 $(LIBS_WIN) -mwindows -o $(GUI)
 
-$(TEST): tests/test_data.cpp opencode_data.cpp session_view.cpp opencode_data.hpp session_view.hpp | $(OUT)
+$(TEST): tests/test_data.cpp opencode_data.cpp session_view.cpp db_maintenance.cpp *.hpp | $(OUT)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -I. $(INCS) \
-	    tests/test_data.cpp opencode_data.cpp session_view.cpp $(LIBDIR) -lsqlite3 $(LIBS_WIN) -o $(TEST)
+	    tests/test_data.cpp opencode_data.cpp session_view.cpp db_maintenance.cpp $(LIBDIR) -lsqlite3 $(LIBS_WIN) -o $(TEST)
 
 clean:
 	-$(CLEANDIR)

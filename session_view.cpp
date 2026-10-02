@@ -6,17 +6,21 @@
 using std::string;
 using std::vector;
 
-bool session_matches(const Session& s, const string& filter) {
-    if (filter.empty()) return true;
-    return utf8_icontains(s.id, filter) || utf8_icontains(s.project_name, filter) ||
-           utf8_icontains(s.worktree, filter) || utf8_icontains(wide_to_utf8(s.title), filter);
+bool session_matches(const Session& s, const ViewQuery& q) {
+    if (q.created_before_ms > 0 && s.time_created >= q.created_before_ms) return false;
+    if (q.max_messages >= 0 && s.msg_count > q.max_messages) return false;
+    if (q.filter.empty()) return true;
+    const string& f = q.filter;
+    return utf8_icontains(s.id, f) || utf8_icontains(s.project_name, f) ||
+           utf8_icontains(s.worktree, f) || utf8_icontains(wide_to_utf8(s.title), f);
 }
 
-bool snapshot_matches(const Snapshot& s, const string& filter, bool orphans_only) {
-    if (orphans_only && s.active_sessions) return false;
-    if (filter.empty()) return true;
-    return utf8_icontains(s.id, filter) || utf8_icontains(s.worktree, filter) ||
-           utf8_icontains(wide_to_utf8(s.name), filter) || utf8_icontains(s.path, filter);
+bool snapshot_matches(const Snapshot& s, const ViewQuery& q) {
+    if (q.orphans_only && s.active_sessions) return false;
+    if (q.filter.empty()) return true;
+    const string& f = q.filter;
+    return utf8_icontains(s.id, f) || utf8_icontains(s.worktree, f) ||
+           utf8_icontains(wide_to_utf8(s.name), f) || utf8_icontains(s.path, f);
 }
 
 namespace {
@@ -56,7 +60,7 @@ vector<int> build_session_view(const vector<Session>& sessions, const ViewQuery&
     vector<int> view;
     view.reserve(sessions.size());
     for (int i = 0; i < (int)sessions.size(); ++i)
-        if (session_matches(sessions[(size_t)i], q.filter)) view.push_back(i);
+        if (session_matches(sessions[(size_t)i], q)) view.push_back(i);
 
     const SortField field = q.field;
     const bool desc = q.descending;
@@ -74,7 +78,7 @@ vector<int> build_snapshot_view(const vector<Snapshot>& snapshots, const ViewQue
     vector<int> view;
     view.reserve(snapshots.size());
     for (int i = 0; i < (int)snapshots.size(); ++i)
-        if (snapshot_matches(snapshots[(size_t)i], q.filter, q.orphans_only)) view.push_back(i);
+        if (snapshot_matches(snapshots[(size_t)i], q)) view.push_back(i);
 
     const SortField field = q.field;
     const bool desc = q.descending;

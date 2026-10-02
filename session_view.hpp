@@ -27,13 +27,16 @@ struct ViewQuery {
     bool orphans_only = false;   // snapshots: hide directories a session still uses
     SortField field = SORT_CREATED;
     bool descending = true;
+    // Rule based selection ("show me what is old / small enough to delete").
+    long long created_before_ms = 0;   // 0 = no lower bound
+    long long max_messages = -1;       // -1 = no upper bound (sessions only)
 };
 
 // Does a row survive the filter? Each front end decides what fields it searches;
 // these are the canonical sets (id/title/project/worktree for sessions,
 // path/name/worktree/id for snapshots).
-bool session_matches(const Session& s, const std::string& filter);
-bool snapshot_matches(const Snapshot& s, const std::string& filter, bool orphans_only);
+bool session_matches(const Session& s, const ViewQuery& q);
+bool snapshot_matches(const Snapshot& s, const ViewQuery& q);
 
 // Indices into the input vector, filtered and ordered.
 std::vector<int> build_session_view(const std::vector<Session>& sessions, const ViewQuery& q);

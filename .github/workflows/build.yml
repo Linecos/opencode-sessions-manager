@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows (MinGW-w64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-ncurses
+          path-type: inherit
+
+      # The build scripts take the toolchain location from MINGW_ROOT/MINGW_OPT,
+      # so the same scripts build against MSYS2 here and against C:\MinGW
+      # locally. OPENCODE_NO_STATIC=1 drops -static: the runner has the shared
+      # ncurses/sqlite3 libraries, and the release build keeps static linking.
+      - name: Build TUI, GUI and tests
+        shell: cmd
+        env:
+          MINGW_ROOT: C:\msys64\mingw64
+          MINGW_OPT: C:\msys64\mingw64
+          OPENCODE_NO_STATIC: "1"
+        run: |
+          build.bat
+          if errorlevel 1 exit /b 1
+          build_gui.bat
+          if errorlevel 1 exit /b 1
+          build_tests.bat
+          if errorlevel 1 exit /b 1
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-session-manager-windows
+          path: |
+            dist/opencode-session-manager.exe
+            dist/opencode-session-manager-gui.exe
+            dist/test_data.exe
+          if-no-files-found: error

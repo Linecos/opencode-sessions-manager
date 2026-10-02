@@ -16,6 +16,11 @@ set INCS=-I"%MINGW_OPT%\include"
 set LIBS=-L"%MINGW_OPT%\lib" -lncursesw -lsqlite3 -luser32 -lshell32 -lole32
 set OUT=dist
 
+rem Set OPENCODE_NO_STATIC=1 when linking against shared libraries
+rem (e.g. an MSYS2 toolchain), which is what CI does.
+set STATIC_FLAG=-static
+if "%OPENCODE_NO_STATIC%"=="1" set STATIC_FLAG=
+
 if not exist "%GCC%.exe" (
     echo g++ not found at "%GCC%.exe"
     echo Set MINGW_ROOT to your MinGW-w64 installation, e.g. set MINGW_ROOT=D:\msys64\ucrt64
@@ -27,8 +32,8 @@ if not exist "%OUT%" mkdir "%OUT%"
 %WINDRES% resource.rc -O coff -o "%OUT%\resource.o"
 if errorlevel 1 goto :fail
 
-%GCC% -std=c++17 -O2 -Wall -static -DNCURSES_WIDECHAR %INCS% ^
-    main.cpp opencode_data.cpp session_view.cpp "%OUT%\resource.o" %LIBS% ^
+%GCC% -std=c++17 -O2 -Wall %STATIC_FLAG% -DNCURSES_WIDECHAR %INCS% ^
+    main.cpp opencode_data.cpp session_view.cpp db_maintenance.cpp "%OUT%\resource.o" %LIBS% ^
     -o "%OUT%\opencode-session-manager.exe"
 if errorlevel 1 goto :fail
 

@@ -1,6 +1,7 @@
 # OpenCode Session Manager
 
 [![Release](https://img.shields.io/github/v/release/Linecos/opencode-session-manager?sort=semver&color=2ea44f)](https://github.com/Linecos/opencode-session-manager/releases/latest)
+[![Build](https://github.com/Linecos/opencode-session-manager/actions/workflows/build.yml/badge.svg)](https://github.com/Linecos/opencode-session-manager/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D6.svg)](#requirements)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](#requirements)
@@ -31,7 +32,11 @@ application, written in C++17 for Windows.
 - Chinese/CJK font support (loads Microsoft YaHei etc. automatically), DPI-aware on scaled displays
   and when dragging between monitors.
 - Orphan `session_diff/*.json` cleanup, either on demand or (opt-in) on exit.
-- A headless `--list` mode, so the same pipeline can be used from scripts.
+- **Database view**: where the disk space actually goes, and the three safe ways to get it back
+  (orphan events, event-log compaction, VACUUM). On a real 4.6 GB database this found 3.9 GB.
+- Session preview (the tail of the conversation) and JSON export of selected sessions.
+- Rule based selection: `--older-than`, `--max-messages`, then "select matching" and delete.
+- A headless CLI for everything the UI does, so the tool is scriptable and testable.
 
 ## Safety
 
@@ -102,11 +107,15 @@ things that are easy to get wrong and impossible to notice by clicking around:
 - a locked database (the delete must fail loudly, not silently),
 - the shared view model: filtering (including CJK and ASCII case folding), every sort field and
   direction, tie-break determinism, and that building a view never mutates its input,
+- the database maintenance module: the space report, the compaction *plan* (and that planning is
+  read-only), orphan event removal, applying a plan, VACUUM, session preview and JSON export,
 - orphan diff cleanup, UTF-8 safe truncation, and the resume-command argument guard.
 
 ```
-96 checks, 0 failed
+133 checks, 0 failed
 ```
+
+GitHub Actions builds the TUI, the GUI and the tests on every push (`.github/workflows/build.yml`).
 
 A helper mode is available for inspecting a real database:
 
@@ -146,7 +155,7 @@ Settings (currently just the text size) are stored per user in
 | `Space` | Toggle selection |
 | `Ctrl+A` | Select all visible rows |
 | `Ctrl+D` | Clear selection |
-| `Tab` | Switch view (Sessions / Snapshots) |
+| `Tab` | Switch view (Sessions / Snapshots / Database) |
 | `F5` | Reload data |
 | `/` | Filter (live, `Enter` applies, `Esc` cancels) |
 | `s` / `S` | Cycle the sort field / reverse the direction |
@@ -155,10 +164,15 @@ Settings (currently just the text size) are stored per user in
 | `o` | Resume the cursor session in a new console |
 | `r` | Reveal the worktree / snapshot folder in Explorer |
 | `O` | Snapshots view: orphan directories only |
+| `p` | Sessions view: preview the tail of the session |
+| `e` | Export the selected sessions to JSON |
 | `x` | Clean orphan `session_diff` files now |
 | `Ctrl+E` | Toggle cleanup-on-exit |
 | `Esc` | Clear the filter, or quit when there is none |
 | `q` | Quit |
+
+Database view keys: `r` scan, `c` analyse the event log (dry run), `x` clean orphan events,
+`b` compact (backs up first), `v` VACUUM, `j`/`k`/`PgUp`/`PgDn` scroll.
 
 The header line shows the filtered/total row count, the active sort and how much space the orphan
 snapshot directories hold. Snapshot sizes are measured a few directories at a time, so the UI stays
@@ -185,16 +199,75 @@ opencode-session-manager.exe --list --filter nixStats --sort msgs
 | `--sort <field>` | `created`, `updated`, `msgs`, `size`, `status`, `id`, `name`, `project` |
 | `--asc` | sort ascending (default: descending) |
 | `--limit <n>` | print at most n rows |
+| `--older-than <days>` | only sessions older than that |
+| `--max-messages <n>` | only sessions with at most n messages |
+| `--preview <id>` | print the tail of a session |
+| `--export <dir>` | write the listed sessions to JSON files |
 | `--cleanup` | also clean orphan `session_diff` files after the UI exits |
 | `--no-recycle` | delete permanently instead of using the Recycle Bin |
 | `--version` | print the version and exit |
 
+## Database maintenance
+
+Everything above cleans sessions, snapshots and diffs — which on a real machine is only a few MB.
+The **Database** view exists because the file is usually somewhere else entirely:
+
+```
+$ opencode-session-manager --db-report
+database file   : 4.4G  (1141873 pages x 4096 bytes)
+  free pages    : 214M   <- reclaimable by VACUUM
+largest tables (estimated from content bytes when dbstat is unavailable):
+  event                       3.6G
+  part                        57.6M
+  ...
+event log 3.6G (232110 rows) by type:
+  message.part.updated.1    191168 rows      3.6G
+  message.updated.1          31481 rows     86.4M
+```
+
+`event` is opencode's append-only event log, and `message.part.updated.1` stores a **complete
+snapshot of a message part on every update** — one part in the database above has **87,121
+versions**, which is 2.8 GB on its own. Deleting a session does not touch those rows, which is why
+the file never shrinks.
+
+Three operations, in increasing order of daring:
+
+| Operation | What it does | Safety |
+|-----------|--------------|--------|
+| `--clean-orphan-events` | Removes event rows whose session no longer exists | Safe: the aggregate is gone, nothing can replay it |
+| `--compact-events` | Keeps only the newest version of each part | **Rewrites the event log.** Dry run by default; a backup is mandatory to apply |
+| `--vacuum` | Rewrites the file so free pages go back to the filesystem | Needs temp space ≈ the file size and a few minutes; close opencode first |
+
+```bat
+rem see where the space goes (read-only)
+opencode-session-manager.exe --db-report
+
+rem reclaim what is provably dead, then compact, then shrink the file
+opencode-session-manager.exe --clean-orphan-events --yes
+opencode-session-manager.exe --compact-events                      rem dry run
+opencode-session-manager.exe --compact-events --yes --backup D:\opencode.db.bak
+opencode-session-manager.exe --vacuum --yes
+```
+
+Notes on compaction, since it is the one that rewrites opencode's data:
+
+- It is a **dry run unless you pass `--yes`**, and `--yes` additionally requires `--backup <file>`.
+  The GUI always takes a backup before applying.
+- Rows whose part id cannot be read (oversized ones) are **never** deleted.
+- It keeps the newest version by `seq`, so the final state of every part is preserved. Whether
+  opencode's replay is happy with the older versions gone can only be proven by running opencode
+  against the result — which is exactly why the backup is not optional.
+- Both front ends share one implementation and run these as background jobs with progress, so a
+  multi-minute VACUUM never freezes the window.
+
 ### GUI usage
 
-- **View** buttons switch between Sessions / Snapshots; the menu bar shows the totals and how much
-  space the orphan snapshot directories hold.
+- **View** buttons switch between Sessions / Snapshots / Database; the menu bar shows the totals and
+  how much space the orphan snapshot directories hold.
 - Toolbar: **Refresh**, **Select All**, **Clear Sel**, **Delete Selected**, **Clean orphan diffs**,
-  a **Cleanup on exit** checkbox, a search box, an **Orphans only** filter and the text size control.
+  a **Cleanup on exit** checkbox, a search box, an **Orphans only** filter, the rule based selection
+  (`Older than [n] days`, `max msgs`, **Select matching**), a **Preview** toggle and the text size
+  control.
 - Click a column header to sort (by default: sessions by creation date, snapshots by size — largest
   first, which is the usual reason to open this tool).
 - Keyboard: `F5` refresh, `Del` remove selected, `Ctrl+A` select all, `Ctrl+D` clear selection,
@@ -202,6 +275,8 @@ opencode-session-manager.exe --list --filter nixStats --sort msgs
   search / selection.
 - Per row actions: **copy** (resume command), **jump** (resume in a new console), **dir** /
   **open** (reveal in Explorer).
+- The **Database** tab has a scan button plus the three maintenance operations, each behind a
+  confirmation dialog, and runs them in the background with a progress bar.
 - **Text size** is adjustable from the toolbar (`Text: 24 px  -  +  reset`); the setting is saved to
   `%APPDATA%\opencode-session-manager\settings.ini`. The default reproduces the size earlier builds
   rendered at — see the note below.

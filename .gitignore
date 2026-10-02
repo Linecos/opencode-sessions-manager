@@ -7,7 +7,7 @@ build/
 out/
 
 # Test scratch directory (build_tests.bat / mingw32-make test)
-test-scratch/
+test-scratch*/
 
 # Editors / IDE
 .idea/

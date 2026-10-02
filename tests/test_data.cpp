@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "opencode_data.hpp"
+#include "db_maintenance.hpp"
 #include "session_view.hpp"
 
 using std::string;
@@ -94,11 +95,11 @@ static const char* SCHEMA =
     "CREATE TABLE session (id TEXT PRIMARY KEY,"
     "        project_id TEXT REFERENCES project(id), title TEXT,"
     "        time_created INTEGER, time_updated INTEGER);"
-    // the realistic part: no FK, just a session_id column
-    "CREATE TABLE message (id TEXT PRIMARY KEY,"
-    "        session_id TEXT, role TEXT);"
-    "CREATE TABLE part (id TEXT PRIMARY KEY,"
-    "        session_id TEXT, message_id TEXT, body TEXT);"
+    // message/part mirror the real columns (JSON payload in `data`)
+    "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT,"
+    "        time_created INTEGER, time_updated INTEGER, data TEXT);"
+    "CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT,"
+    "        time_created INTEGER, time_updated INTEGER, data TEXT);"
     // a grandchild that only knows about its message
     "CREATE TABLE attachment (id TEXT PRIMARY KEY,"
     "        message_id TEXT, url TEXT);"
@@ -106,7 +107,12 @@ static const char* SCHEMA =
     "CREATE TABLE todo (id TEXT PRIMARY KEY,"
     "        session_id TEXT REFERENCES session(id) ON DELETE CASCADE, name TEXT);"
     "CREATE TABLE session_share (id TEXT PRIMARY KEY,"
-    "        session_id TEXT REFERENCES session(id) ON DELETE CASCADE, url TEXT);";
+    "        session_id TEXT REFERENCES session(id) ON DELETE CASCADE, url TEXT);"
+    // the append-only event log: the real space hog, with full part snapshots
+    "CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, seq INTEGER,"
+    "        type TEXT, data TEXT);"
+    "CREATE UNIQUE INDEX event_aggregate_seq_idx ON event (aggregate_id, seq);"
+    "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER);";
 
 struct Fixture {
     string root;         // scratch root (contains non-ASCII characters on purpose)
@@ -149,14 +155,53 @@ static Fixture build_fixture(const string& scratch) {
     db_exec(db,
             "INSERT INTO session VALUES ('ses-ccc', 'proj-gone', 'orphaned project', 1700002000000, 1700002900000);");
 
-    db_exec(db, "INSERT INTO message VALUES ('msg-1', 'ses-aaa', 'user');");
-    db_exec(db, "INSERT INTO message VALUES ('msg-2', 'ses-aaa', 'assistant');");
-    db_exec(db, "INSERT INTO message VALUES ('msg-3', 'ses-bbb', 'user');");
-    db_exec(db, "INSERT INTO message VALUES ('msg-4', 'ses-ccc', 'user');");
-    db_exec(db, "INSERT INTO part VALUES ('part-1', 'ses-aaa', 'msg-1', 'hello');");
-    db_exec(db, "INSERT INTO part VALUES ('part-2', 'ses-aaa', 'msg-2', 'world');");
-    db_exec(db, "INSERT INTO part VALUES ('part-3', 'ses-bbb', 'msg-3', 'keep me');");
-    db_exec(db, "INSERT INTO part VALUES ('part-4', 'ses-ccc', 'msg-4', 'keep me too');");
+    db_exec(db, "INSERT INTO message VALUES ('msg-1','ses-aaa',1000,1100,'{\"role\":\"user\"}');");
+    db_exec(db, "INSERT INTO message VALUES ('msg-2','ses-aaa',2000,2100,'{\"role\":\"assistant\"}');");
+    db_exec(db, "INSERT INTO message VALUES ('msg-3','ses-bbb',3000,3100,'{\"role\":\"user\"}');");
+    db_exec(db, "INSERT INTO message VALUES ('msg-4','ses-ccc',4000,4100,'{\"role\":\"user\"}');");
+    db_exec(db,
+            "INSERT INTO part VALUES ('part-1','ses-aaa','msg-1',1000,1100,"
+            "'{\"type\":\"text\",\"text\":\"hello from part 1\"}');");
+    db_exec(db,
+            "INSERT INTO part VALUES ('part-2','ses-aaa','msg-2',2000,2100,"
+            "'{\"type\":\"tool\",\"tool\":\"read\"}');");
+    db_exec(db,
+            "INSERT INTO part VALUES ('part-3','ses-bbb','msg-3',3000,3100,"
+            "'{\"type\":\"text\",\"text\":\"keep me\"}');");
+    db_exec(db,
+            "INSERT INTO part VALUES ('part-4','ses-ccc','msg-4',4000,4100,"
+            "'{\"type\":\"text\",\"text\":\"keep me too\"}');");
+
+    // The append-only event log: full snapshots of a part on every update, plus
+    // one aggregate (ses-ghost) whose session row no longer exists.
+    {
+        auto add_event = [&](const string& agg, long long seq, const string& type,
+                             const string& payload) {
+            string sql = "INSERT INTO event VALUES ('evt-" + agg + "-" + std::to_string(seq) +
+                         "','" + agg + "'," + std::to_string(seq) + ",'" + type + "','" + payload +
+                         "')";
+            db_exec(db, sql);
+        };
+        auto part_payload = [](const string& sid, const string& pid, const string& text) {
+            return "{\"sessionID\":\"" + sid + "\",\"part\":{\"id\":\"" + pid +
+                   "\",\"sessionID\":\"" + sid + "\",\"type\":\"text\",\"text\":\"" + text + "\"}}";
+        };
+        // prt-1: 5 versions (4 redundant), prt-2: 2 versions (1 redundant)
+        for (int v = 1; v <= 5; ++v)
+            add_event("ses-aaa", v, "message.part.updated.1",
+                      part_payload("ses-aaa", "prt-1", string((size_t)v * 10, 'x')));
+        add_event("ses-aaa", 6, "message.part.updated.1", part_payload("ses-aaa", "prt-2", "one"));
+        add_event("ses-aaa", 7, "message.part.updated.1", part_payload("ses-aaa", "prt-2", "two"));
+        add_event("ses-aaa", 8, "message.updated.1",
+                  "{\"sessionID\":\"ses-aaa\",\"message\":{\"id\":\"msg-1\"}}");
+        // prt-3: 2 versions (1 redundant)
+        add_event("ses-bbb", 1, "message.part.updated.1", part_payload("ses-bbb", "prt-3", "a"));
+        add_event("ses-bbb", 2, "message.part.updated.1", part_payload("ses-bbb", "prt-3", "ab"));
+        // three orphan rows belonging to a session that is gone
+        add_event("ses-ghost", 1, "message.part.updated.1", part_payload("ses-ghost", "prt-9a", "g1"));
+        add_event("ses-ghost", 2, "message.part.updated.1", part_payload("ses-ghost", "prt-9b", "g2"));
+        add_event("ses-ghost", 3, "message.part.updated.1", part_payload("ses-ghost", "prt-9c", "g3"));
+    }
     db_exec(db, "INSERT INTO attachment VALUES ('att-1', 'msg-1', 'a.png');");
     db_exec(db, "INSERT INTO attachment VALUES ('att-2', 'msg-3', 'b.png');");
     db_exec(db, "INSERT INTO todo VALUES ('todo-1', 'ses-aaa', 'first task');");
@@ -557,6 +602,105 @@ static void test_view_model() {
     CHECK(string(sort_field_name(SORT_FIELD_COUNT)) == "?", "unknown sort field is labelled");
 }
 
+// ---------------------------------------------------------------------------
+// Database maintenance: space analysis, orphan events, compaction, VACUUM,
+// preview and export. Uses its own fixture so that the destructive steps cannot
+// interfere with the other tests.
+// ---------------------------------------------------------------------------
+static void test_db_maintenance(const string& scratch) {
+    SECTION("db maintenance: report");
+    Fixture fx = build_fixture(scratch + "-maint");
+
+    DbReport r = analyze_database(fx.db, 5, nullptr);
+    CHECK(r.page_size > 0 && r.page_count > 0, "report: page size/count");
+    CHECK(r.file_bytes == r.page_size * r.page_count, "report: file size = pages * page size");
+    CHECK(r.session_rows == 3, "report: session rows");
+    CHECK(r.event_rows == 13, "report: event rows");
+    CHECK(r.event_bytes > 0, "report: event text bytes");
+    CHECK(!r.event_types.empty() && r.event_types[0].name == "message.part.updated.1",
+          "report: biggest event type is part.updated");
+    CHECK(r.orphan_event_rows == 3, "report: orphan event rows (deleted session)");
+    CHECK(r.orphan_event_bytes > 0, "report: orphan event bytes");
+    CHECK(r.reclaimable_safe() >= r.orphan_event_bytes,
+          "report: safe reclaimable includes the free pages");
+    bool has_event_table = false;
+    for (auto& t : r.tables)
+        if (t.name == "event") has_event_table = true;
+    CHECK(has_event_table, "report: the table list contains event");
+    CHECK(!r.sessions.empty() && r.sessions[0].bytes >= r.sessions.back().bytes,
+          "report: sessions are ordered by event footprint");
+
+    SECTION("db maintenance: compaction plan is read-only");
+    long long size_before = file_size(fx.db);
+    CompactionPlan plan = plan_event_compaction(fx.db, nullptr);
+    CHECK(plan.total_rows == 12, "plan: counts only part.updated rows");
+    CHECK(plan.parts == 6, "plan: six distinct parts");
+    CHECK(plan.removable_rows == 6, "plan: six redundant versions");
+    CHECK(plan.removable_bytes > 0, "plan: removable bytes estimated");
+    CHECK(file_size(fx.db) == size_before, "plan: a dry run does not touch the database");
+    CHECK(!plan.worst_parts.empty() && plan.worst_parts[0].name == "prt-1",
+          "plan: worst part is the one with five versions");
+
+    SECTION("db maintenance: orphan events");
+    ReclaimResult c = delete_orphan_events(fx.db, nullptr);
+    CHECK(c.rows == 3, "orphans: three rows removed");
+    sqlite3* db = nullptr;
+    db_open(fx.db, &db);
+    CHECK(db_scalar(db, "SELECT COUNT(*) FROM event WHERE aggregate_id='ses-ghost'") == 0,
+          "orphans: the ghost aggregate is gone");
+    CHECK(db_scalar(db, "SELECT COUNT(*) FROM event WHERE aggregate_id='ses-aaa'") == 8,
+          "orphans: live events untouched");
+    sqlite3_close(db);
+
+    SECTION("db maintenance: apply compaction");
+    ReclaimResult a = apply_event_compaction(fx.db, plan, nullptr);
+    CHECK(a.rows == 6, "compact: six rows removed");
+    db_open(fx.db, &db);
+    CHECK(db_scalar(db, "SELECT COUNT(*) FROM event") == 4,
+          "compact: four rows left (one per part + the message event)");
+    CHECK(db_scalar(db, "SELECT COUNT(*) FROM event WHERE data LIKE '%prt-1%'") == 1,
+          "compact: only the newest version of prt-1 survives");
+    CHECK(db_scalar(db, "SELECT seq FROM event WHERE data LIKE '%prt-1%'") == 5,
+          "compact: and it is the one with the highest seq");
+    CHECK(db_scalar(db, "SELECT COUNT(*) FROM event WHERE type='message.updated.1'") == 1,
+          "compact: other event types are left alone");
+    sqlite3_close(db);
+
+    SECTION("db maintenance: vacuum and preview");
+    ReclaimResult v;
+    bool vacuum_ok = vacuum_database(fx.db, &v, nullptr);
+    CHECK(vacuum_ok, "vacuum: succeeds on a healthy database");
+    CHECK(v.file_after <= v.file_before, "vacuum: the file does not grow");
+    CHECK(!database_is_busy(fx.db), "vacuum: no other writer reports not-busy");
+
+    std::vector<PreviewMessage> msgs = load_session_preview(fx.db, "ses-aaa", 10);
+    CHECK(msgs.size() == 2, "preview: two parts for ses-aaa");
+    bool saw_text = false, saw_role = false;
+    for (auto& m : msgs) {
+        if (m.text.find("hello from part 1") != string::npos) saw_text = true;
+        if (m.role == "user" || m.role == "assistant") saw_role = true;
+    }
+    CHECK(saw_text, "preview: extracts the text payload");
+    CHECK(saw_role, "preview: joins the message role");
+    CHECK(load_session_preview(fx.db, "no-such-session", 5).empty(),
+          "preview: unknown session yields nothing");
+
+    SECTION("db maintenance: export");
+    std::vector<string> written;
+    string err;
+    string out_dir = path_join(fx.root, "导出");
+    CHECK(export_sessions_json(fx.db, {"ses-aaa", "ses-bbb"}, out_dir, &written, &err),
+          "export: writes both sessions");
+    CHECK(written.size() == 2, "export: two files reported");
+    CHECK(!written.empty() && file_size(written[0]) > 0, "export: file is not empty");
+    bool all_written = true;
+    for (auto& w : written)
+        if (!path_exists(w)) all_written = false;
+    CHECK(all_written, "export: every reported file exists");
+    CHECK(export_sessions_json(fx.db, {"ses-aaa"}, "", nullptr, &err) == false,
+          "export: an empty destination directory is refused");
+}
+
 static void test_launch_guard() {    SECTION("launch guard");
 
     string err;
@@ -609,6 +753,7 @@ int main(int argc, char** argv) {
     test_orphan_diffs(fx);
     test_locked_database(fx);
     test_remove_tree(fx);
+    test_db_maintenance(scratch);
     test_launch_guard();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

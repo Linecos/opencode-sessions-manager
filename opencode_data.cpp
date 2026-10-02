@@ -251,6 +251,18 @@ long long total_dir_size(const string& p) {
 #endif
 }
 
+long long file_size(const string& p) {
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(win_path(p).c_str(), GetFileExInfoStandard, &fad)) return 0;
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return 0;
+    return ((long long)fad.nFileSizeHigh << 32) | (long long)fad.nFileSizeLow;
+#else
+    (void)p;
+    return 0;
+#endif
+}
+
 // ===========================================================================
 // Removal: Recycle Bin by default, permanent only when asked for
 // ===========================================================================

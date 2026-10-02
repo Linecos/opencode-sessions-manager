@@ -38,11 +38,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "opencode_data.hpp"
+#include "db_maintenance.hpp"
 #include "session_view.hpp"
 #include "version.h"
 
@@ -65,6 +67,7 @@ static string u8fmt_size(long long sz) { return u8(format_size(sz)); }
 // ---------------------------------------------------------------------------
 static const int TAB_SESSIONS = 0;
 static const int TAB_SNAPSHOTS = 1;
+static const int TAB_DATABASE = 2;
 
 // How many snapshot sizes we walk per frame. Sizing a snapshot directory means
 // recursing the whole tree; doing all of them in one go is what used to freeze
@@ -96,6 +99,74 @@ static bool g_cleanup_on_exit = false;
 static bool g_confirm_request = false;
 static bool g_confirm_open = false;
 static bool g_focus_filter = false;
+
+// ---------------------------------------------------------------------------
+// Rule based selection, session preview, and database maintenance state
+// ---------------------------------------------------------------------------
+static int g_older_days_i = 0;        // 0 = no age bound
+static int g_max_msgs_i = -1;         // -1 = no bound
+static bool g_show_preview = false;
+static std::vector<PreviewMessage> g_preview;
+static string g_preview_for;          // session id the preview belongs to
+static string g_preview_error;
+
+static MaintenanceJob g_job;
+static bool g_job_seen = false;       // a finished job has been reported already
+
+// A maintenance action waiting for confirmation.
+static int g_maint_action = 0;
+static bool g_maint_modal = false;
+static bool g_maint_keep_backup = false;
+static string g_maint_backup_path;
+
+enum { MA_NONE = 0, MA_CLEAN_ORPHANS, MA_COMPACT, MA_VACUUM, MA_BACKUP };
+
+static string timestamped_backup_path() {
+    time_t now = time(nullptr);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%04d%02d%02d-%02d%02d%02d", tmv.tm_year + 1900, tmv.tm_mon + 1,
+             tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    return GUI_DB_PATH + ".backup-" + buf;
+}
+
+// Keeps the preview panel in sync with the (single) selected session.
+static void sync_preview() {
+    if (!g_show_preview || g_tab != TAB_SESSIONS) {
+        g_preview.clear();
+        g_preview_for.clear();
+        return;
+    }
+    string want;
+    if (g_selected.size() == 1) want = *g_selected.begin();
+    if (want == g_preview_for) return;
+
+    g_preview.clear();
+    g_preview_error.clear();
+    g_preview_for = want;
+    if (want.empty()) return;
+    try {
+        g_preview = load_session_preview(GUI_DB_PATH, want, 12);
+    } catch (const std::exception& e) {
+        g_preview_error = e.what();
+    }
+}
+
+static void start_maintenance(int action) {
+    switch (action) {
+    case MA_CLEAN_ORPHANS: g_job.start(JobType::CleanupOrphans, GUI_DB_PATH); break;
+    case MA_COMPACT: g_job.start(JobType::CompactEvents, GUI_DB_PATH, g_maint_backup_path); break;
+    case MA_VACUUM: g_job.start(JobType::Vacuum, GUI_DB_PATH); break;
+    case MA_BACKUP: g_job.start(JobType::Backup, GUI_DB_PATH, g_maint_backup_path); break;
+    default: break;
+    }
+    g_job_seen = false;
+}
 
 // ---------------------------------------------------------------------------
 // Text size
@@ -199,10 +270,19 @@ static SortField snapshot_sort_field(int column) {
 }
 
 static void rebuild_views() {
+    // Rule based bounds shared by both views (they only apply to sessions).
+    long long created_before = 0;
+    if (g_older_days_i > 0) {
+        time_t now = time(nullptr);
+        created_before = (long long)(now - (time_t)g_older_days_i * 24 * 3600) * 1000;
+    }
+
     ViewQuery sq;
     sq.filter = g_filter;
     sq.field = session_sort_field(g_sort_col[TAB_SESSIONS]);
     sq.descending = !g_sort_asc[TAB_SESSIONS];
+    sq.created_before_ms = created_before;
+    sq.max_messages = g_max_msgs_i;
     g_view_sessions = build_session_view(g_sessions, sq);
 
     ViewQuery pq;
@@ -441,6 +521,42 @@ static void draw_toolbar() {
     ImGui::Checkbox("Orphans only", &g_orphans_only);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Snapshots view: only directories with no session referencing them");
+
+    // Rule based selection: filter, then grab everything that matches.
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+    ImGui::TextUnformatted("Older than");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 3.2f);
+    if (ImGui::InputInt("##olderdays", &g_older_days_i, 0, 0)) {
+        if (g_older_days_i < 0) g_older_days_i = 0;
+        g_view_dirty = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Sessions view: only sessions created more than N days ago (0 = off)");
+    ImGui::SameLine();
+    ImGui::TextUnformatted("days");
+    ImGui::SameLine();
+    ImGui::TextUnformatted("max msgs");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 3.2f);
+    if (ImGui::InputInt("##maxmsgs", &g_max_msgs_i, 0, 0)) {
+        if (g_max_msgs_i < -1) g_max_msgs_i = -1;
+        g_view_dirty = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Sessions view: only sessions with at most N messages (-1 = off)");
+    ImGui::SameLine();
+    if (ImGui::Button("Select matching")) select_all_visible();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Select every row the current filter shows (then Delete Selected)");
+
+    ImGui::SameLine();
+    ImGui::Checkbox("Preview", &g_show_preview);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Sessions view: show the tail of the selected session");
+
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
@@ -690,6 +806,344 @@ static void draw_snapshots_tab() {
 }
 
 // ---------------------------------------------------------------------------
+// UI: session preview panel
+// ---------------------------------------------------------------------------
+static void draw_preview_panel() {
+    if (!g_show_preview || g_tab != TAB_SESSIONS) return;
+
+    float h = ImGui::GetTextLineHeightWithSpacing() * 8.0f + ImGui::GetFrameHeightWithSpacing();
+    ImGui::BeginChild("##preview", ImVec2(0, h), true);
+    ImGui::TextDisabled("Preview");
+    ImGui::SameLine();
+    if (g_preview_for.empty())
+        ImGui::TextDisabled("- select exactly one session");
+    else
+        ImGui::TextDisabled("%s   (%d part(s) shown)", g_preview_for.c_str(), (int)g_preview.size());
+
+    if (!g_preview_error.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "%s", g_preview_error.c_str());
+    } else if (!g_preview_for.empty() && g_preview.empty()) {
+        ImGui::TextDisabled("No parts recorded for this session.");
+    }
+    ImGui::Separator();
+    for (auto& m : g_preview) {
+        bool user = (m.role == "user");
+        ImGui::TextColored(user ? ImVec4(0.55f, 0.78f, 1.0f, 1.0f) : ImVec4(0.6f, 0.9f, 0.6f, 1.0f),
+                           "%s", m.role.empty() ? m.kind.c_str() : m.role.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", u8fmt_time(m.time_created).c_str());
+        ImGui::TextWrapped("%s", m.text.c_str());
+    }
+    ImGui::EndChild();
+}
+
+// ---------------------------------------------------------------------------
+// UI: database space report and maintenance
+// ---------------------------------------------------------------------------
+static void draw_usage_table(const char* id, const char* col0, const char* col1,
+                             const std::vector<UsageEntry>& rows, bool show_extra) {
+    if (!ImGui::BeginTable(id, show_extra ? 4 : 3,
+                           ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                           ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 7.0f)))
+        return;
+    ImGui::TableSetupColumn(col0, ImGuiTableColumnFlags_WidthStretch, 3.0f);
+    ImGui::TableSetupColumn(col1, ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 9.0f);
+    ImGui::TableSetupColumn("size", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 7.0f);
+    if (show_extra) ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableHeadersRow();
+    for (auto& e : rows) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted(e.name.c_str());
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Text("%d", (int)e.rows);
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextUnformatted(u8fmt_size(e.bytes).c_str());
+        if (show_extra) {
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextUnformatted(e.extra.c_str());
+        }
+    }
+    ImGui::EndTable();
+}
+
+static void draw_job_progress() {
+    JobStatus st = g_job.status();
+    if (!st.running) return;
+    if (st.percent >= 0)
+        ImGui::ProgressBar(st.percent / 100.0f, ImVec2(-1.0f, 0.0f), st.stage.c_str());
+    else {
+        ImGui::ProgressBar(-1.0f * (float)ImGui::GetTime(), ImVec2(-1.0f, 0.0f), "");
+        ImGui::TextDisabled("%s", st.stage.c_str());
+    }
+}
+
+static void draw_database_tab() {
+    JobStatus st = g_job.status();
+    const bool busy = st.running;
+
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("Scan database")) g_job.start(JobType::Report, GUI_DB_PATH);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Read-only. Shows where the disk space goes\n(this takes a minute or two on a large database)");
+
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+    if (ImGui::Button("Analyse event log")) g_job.start(JobType::CompactEvents, GUI_DB_PATH);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Dry run: how much would keeping only the newest\nversion of each part reclaim?");
+
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+    if (ImGui::Button("Clean orphan events")) {
+        g_maint_action = MA_CLEAN_ORPHANS;
+        g_maint_backup_path.clear();
+        g_maint_modal = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Remove event rows belonging to sessions that are already deleted.\nSafe: nothing can replay a deleted aggregate.");
+
+    ImGui::SameLine();
+    if (ImGui::Button("Compact event log")) {
+        g_maint_action = MA_COMPACT;
+        g_maint_keep_backup = true;
+        g_maint_backup_path = timestamped_backup_path();
+        g_maint_modal = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Keep only the newest snapshot of each message part.\nThis rewrites the opencode event log - back up first.");
+
+    ImGui::SameLine();
+    if (ImGui::Button("VACUUM")) {
+        g_maint_action = MA_VACUUM;
+        g_maint_backup_path.clear();
+        g_maint_modal = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Rewrite the file to hand free pages back to the filesystem.\nNeeds temp space and a few minutes; close opencode first.");
+
+    ImGui::SameLine();
+    if (ImGui::Button("Backup database")) {
+        g_maint_action = MA_BACKUP;
+        g_maint_backup_path = timestamped_backup_path() + ".bak";
+        g_maint_modal = true;
+    }
+    ImGui::EndDisabled();
+
+    if (busy) {
+        ImGui::Spacing();
+        draw_job_progress();
+    } else if (st.finished) {
+        ImGui::Spacing();
+        if (st.type == JobType::CleanupOrphans || st.type == JobType::CompactEvents) {
+            if (st.ok)
+                ImGui::Text("%s: removed %d rows (%s)", job_type_name(st.type), (int)st.result.rows,
+                            u8fmt_size(st.result.bytes).c_str());
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "%s failed: %s",
+                                   job_type_name(st.type), st.error.c_str());
+            if (st.ok && st.result.file_before == st.result.file_after)
+                ImGui::TextDisabled("The file only shrinks after a VACUUM.");
+        } else if (st.type == JobType::Vacuum) {
+            if (st.ok)
+                ImGui::Text("VACUUM: %s -> %s (freed %s)",
+                            u8fmt_size(st.result.file_before).c_str(),
+                            u8fmt_size(st.result.file_after).c_str(),
+                            u8fmt_size(st.result.bytes).c_str());
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "VACUUM failed: %s",
+                                   st.error.c_str());
+        } else if (st.type == JobType::Backup) {
+            if (st.ok)
+                ImGui::Text("Backup written (%s)", u8fmt_size(st.result.bytes).c_str());
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "Backup failed: %s",
+                                   st.error.c_str());
+        } else if (st.type == JobType::Report && !st.error.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "Scan failed: %s", st.error.c_str());
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    const DbReport& r = st.report;
+    if (r.file_bytes <= 0) {
+        ImGui::TextDisabled("Press \"Scan database\" to see where the space goes.");
+        ImGui::Spacing();
+        ImGui::TextWrapped(
+            "Background: in a real opencode database 90%%+ of the file can be the append-only `event` "
+            "log, which stores a complete snapshot of a message part on every update. Deleting "
+            "sessions does not touch those rows, which is why the file never shrinks.");
+        return;
+    }
+
+    if (ImGui::BeginTable("dbmetrics", 3, ImGuiTableFlags_SizingStretchSame)) {
+        const char* labels[3] = {"database file", "free pages (VACUUM)",
+                                 "safe to reclaim now"};
+        char values[3][64];
+        snprintf(values[0], 64, "%s", u8fmt_size(r.file_bytes).c_str());
+        snprintf(values[1], 64, "%s", u8fmt_size(r.free_bytes).c_str());
+        snprintf(values[2], 64, "%s", u8fmt_size(r.reclaimable_safe()).c_str());
+        for (int i = 0; i < 3; ++i) {
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", labels[i]);
+            ImGui::Text("%s", values[i]);
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Spacing();
+    ImGui::Text("event log: %d rows, %s   |   session %d, message %d, part %d",
+                (int)r.event_rows, u8fmt_size(r.event_bytes).c_str(), (int)r.session_rows,
+                (int)r.message_rows, (int)r.part_rows);
+    ImGui::Spacing();
+
+    if (ImGui::BeginTabBar("dbtabs")) {
+        if (ImGui::BeginTabItem("Tables")) {
+            draw_usage_table("t_tables", "table", "rows",
+                             r.tables, false);
+            if (!r.dbstat_available)
+                ImGui::TextDisabled("dbstat is not compiled into this sqlite3, so sizes are estimated from content bytes.");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Event types")) {
+            draw_usage_table("t_types", "event type", "rows", r.event_types, false);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Sessions")) {
+            JobStatus cur = g_job.status();
+            (void)cur;
+            draw_usage_table("t_sessions", "session", "rows", r.sessions, true);
+            ImGui::TextDisabled("Tip: switch to the Sessions view and delete these to stop them growing.");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Oversized")) {
+            if (r.big_items.empty())
+                ImGui::TextDisabled("Nothing unusually large.");
+            else
+                draw_usage_table("t_big", "object", "rows", r.big_items, false);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::Text("orphan events (deleted sessions): %d rows, %s", (int)r.orphan_event_rows,
+                u8fmt_size(r.orphan_event_bytes).c_str());
+    if (st.plan.total_rows > 0) {
+        ImGui::Text("event log compaction: %d of %d rows redundant, %s reclaimable", (int)st.plan.removable_rows,
+                    (int)st.plan.total_rows, u8fmt_size(st.plan.removable_bytes).c_str());
+        if (!st.plan.worst_parts.empty()) {
+            ImGui::TextDisabled("worst part: %s with %d versions", st.plan.worst_parts[0].name.c_str(),
+                                (int)st.plan.worst_parts[0].rows);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UI: maintenance confirmation
+// ---------------------------------------------------------------------------
+static void draw_maintenance_modal() {
+    if (!g_maint_modal) return;
+    ImGui::OpenPopup("Database maintenance");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+    if (ImGui::BeginPopupModal("Database maintenance", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+        JobStatus st = g_job.status();
+        switch (g_maint_action) {
+        case MA_CLEAN_ORPHANS:
+            ImGui::Text("Clean orphan events?");
+            ImGui::TextWrapped(
+                "Removes event rows that belong to sessions which no longer exist. "
+                "Nothing can replay a deleted aggregate, so this is safe.");
+            if (st.report.orphan_event_rows > 0)
+                ImGui::Text("Would remove %d rows, about %s.", (int)st.report.orphan_event_rows,
+                            u8fmt_size(st.report.orphan_event_bytes).c_str());
+            else
+                ImGui::TextDisabled("Run \"Scan database\" first for an exact figure.");
+            break;
+        case MA_COMPACT:
+            ImGui::Text("Compact the event log?");
+            ImGui::TextWrapped(
+                "opencode stores a complete snapshot of a message part on every update, so one part "
+                "can have tens of thousands of versions. This keeps only the newest version of each "
+                "part and deletes the rest. It rewrites the opencode event log.");
+            if (st.plan.total_rows > 0)
+                ImGui::Text("Would remove %d rows, about %s.", (int)st.plan.removable_rows,
+                            u8fmt_size(st.plan.removable_bytes).c_str());
+            else
+                ImGui::TextDisabled("Tip: run \"Analyse event log\" first (dry run) for exact figures.");
+            ImGui::Checkbox("Back up the database first (recommended)", &g_maint_keep_backup);
+            if (g_maint_keep_backup) {
+                char buf[512];
+                snprintf(buf, sizeof(buf), "%s", g_maint_backup_path.c_str());
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26.0f);
+                if (ImGui::InputText("##backup", buf, sizeof(buf))) g_maint_backup_path = buf;
+                ImGui::TextDisabled("%s free space needed; the file only shrinks after a VACUUM.",
+                                    u8fmt_size(st.report.file_bytes > 0 ? st.report.file_bytes
+                                                                       : file_size(GUI_DB_PATH))
+                                        .c_str());
+            }
+            break;
+        case MA_VACUUM:
+            ImGui::Text("Run VACUUM?");
+            ImGui::TextWrapped(
+                "VACUUM rewrites the whole file so free pages go back to the filesystem. It needs "
+                "temporary disk space about the size of the database and takes a few minutes on a "
+                "multi-GB file.");
+            if (st.report.free_bytes > 0)
+                ImGui::Text("Free pages now: %s.", u8fmt_size(st.report.free_bytes).c_str());
+            if (database_is_busy(GUI_DB_PATH))
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                                   "opencode appears to be holding the database: VACUUM will fail.");
+            break;
+        case MA_BACKUP:
+            ImGui::Text("Back up the database?");
+            ImGui::TextWrapped("Copies the database file with sqlite3's online backup API.");
+            {
+                char buf[512];
+                snprintf(buf, sizeof(buf), "%s", g_maint_backup_path.c_str());
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26.0f);
+                if (ImGui::InputText("##backupdest", buf, sizeof(buf))) g_maint_backup_path = buf;
+            }
+            break;
+        default:
+            break;
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        bool can_go = !g_job.running();
+        if (g_maint_action == MA_COMPACT && g_maint_keep_backup && g_maint_backup_path.empty())
+            can_go = false;
+        if (g_maint_action == MA_BACKUP && g_maint_backup_path.empty()) can_go = false;
+
+        ImGui::BeginDisabled(!can_go);
+        if (ImGui::Button("Confirm", ImVec2(ImGui::GetFontSize() * 7.0f, 0.0f))) {
+            g_maint_modal = false;
+            ImGui::CloseCurrentPopup();
+            start_maintenance(g_maint_action);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(ImGui::GetFontSize() * 7.0f, 0.0f))) {
+            g_maint_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UI: modals
 // ---------------------------------------------------------------------------
 static void draw_confirm_modal() {
@@ -876,6 +1330,12 @@ static void draw_ui() {
             g_selected.clear();
             g_view_dirty = true;
         }
+        ImGui::Separator();
+        if (ImGui::Button(g_tab == TAB_DATABASE ? "[Database]" : "Database")) {
+            g_tab = TAB_DATABASE;
+            g_selected.clear();
+            g_view_dirty = true;
+        }
         ImGui::SameLine(0, 40);
         size_t orphans = 0;
         long long orphan_bytes = 0;
@@ -905,11 +1365,62 @@ static void draw_ui() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    if (g_tab == TAB_SESSIONS) draw_sessions_tab();
-    else draw_snapshots_tab();
+    if (g_tab == TAB_SESSIONS) {
+        draw_sessions_tab();
+        sync_preview();
+        draw_preview_panel();
+    } else if (g_tab == TAB_SNAPSHOTS) {
+        draw_snapshots_tab();
+    } else {
+        draw_database_tab();
+    }
 
     // Keep the sizes trickling in after the frame is built.
     pump_size_scan(SIZE_SCAN_PER_FRAME);
+
+    // Report a finished background job exactly once, and pick up its effects.
+    {
+        JobStatus st = g_job.status();
+        if (st.finished && !g_job_seen) {
+            g_job_seen = true;
+            if (!st.ok && !st.error.empty()) {
+                g_error = st.error;
+                g_message = "Error";
+            } else {
+                switch (st.type) {
+                case JobType::Report:
+                    g_message = "Database scanned.";
+                    break;
+                case JobType::CleanupOrphans:
+                    g_message = "Removed " + std::to_string(st.result.rows) +
+                                " orphan event row(s) (" + u8fmt_size(st.result.bytes) + ")";
+                    refresh_data(true);
+                    break;
+                case JobType::CompactEvents:
+                    if (st.result.rows > 0) {
+                        g_message = "Compacted " + std::to_string(st.result.rows) +
+                                    " redundant event row(s) (" + u8fmt_size(st.result.bytes) +
+                                    "); run VACUUM to release the space";
+                        refresh_data(true);
+                    } else {
+                        g_message = "Event log analysed: " +
+                                    std::to_string(st.plan.removable_rows) +
+                                    " redundant row(s), " + u8fmt_size(st.plan.removable_bytes);
+                    }
+                    break;
+                case JobType::Vacuum:
+                    g_message = "VACUUM finished: " + u8fmt_size(st.result.file_before) + " -> " +
+                                u8fmt_size(st.result.file_after);
+                    break;
+                case JobType::Backup:
+                    g_message = "Backup written (" + u8fmt_size(st.result.bytes) + ")";
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+    }
 
     // Status line
     ImGui::Spacing();
@@ -933,6 +1444,8 @@ static void draw_ui() {
 
     draw_confirm_modal();
     draw_error_modal();
+    draw_maintenance_modal();
+
 
     ImGui::End();
     draw_toast();
@@ -953,6 +1466,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
     case WM_ERASEBKGND:
         return 1;           // don't flicker; we repaint every frame
+    case WM_CLOSE:
+        // Never abandon a maintenance job half way: a VACUUM or a compaction is
+        // a single long SQLite call, and killing the process mid-way would leave
+        // the work unfinished with no way to report it.
+        if (g_job.running()) {
+            MessageBoxW(hwnd, L"A database job is still running.\n\nWait for it to finish, then close.",
+                        L"opencode session manager", MB_ICONINFORMATION | MB_OK);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
     case WM_DPICHANGED: {
         // Follow the OS-suggested rect; the scale change itself is picked up by
         // the main loop, which re-bakes the style and font scale.

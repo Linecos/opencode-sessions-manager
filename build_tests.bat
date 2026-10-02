@@ -21,7 +21,7 @@ if not exist "%GCC%.exe" (
 if not exist "%OUT%" mkdir "%OUT%"
 
 %GCC% -std=c++17 -O2 -Wall -Wextra %INCS% ^
-    tests\test_data.cpp opencode_data.cpp session_view.cpp %LIBS% ^
+    tests\test_data.cpp opencode_data.cpp session_view.cpp db_maintenance.cpp %LIBS% ^
     -o "%OUT%\test_data.exe"
 if errorlevel 1 goto :fail
 

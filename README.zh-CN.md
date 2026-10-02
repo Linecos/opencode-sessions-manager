@@ -1,6 +1,7 @@
 # OpenCode Session Manager
 
 [![Release](https://img.shields.io/github/v/release/Linecos/opencode-session-manager?sort=semver&color=2ea44f)](https://github.com/Linecos/opencode-session-manager/releases/latest)
+[![Build](https://github.com/Linecos/opencode-session-manager/actions/workflows/build.yml/badge.svg)](https://github.com/Linecos/opencode-session-manager/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D6.svg)](#环境要求)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](#环境要求)
@@ -24,7 +25,10 @@
 - 快照体积按每帧几个目录渐进测量，数据目录很大时两个前端都不会卡住。
 - 中文/CJK 字体支持（自动加载微软雅黑等），在缩放显示器上 DPI 正确，跨不同缩放的显示器拖动也能跟随。
 - 孤儿 `session_diff/*.json` 清理：可随时手动触发，也可选择退出时清理（默认关闭）。
-- 提供无界面 `--list` 模式，同一条管线可以直接写进脚本。
+- **数据库视图**：看清磁盘到底被什么占了，以及三种安全的回收手段（孤儿事件 / 事件日志压缩 / VACUUM）。在一台真实的 4.6 GB 库上，它找出了 3.9 GB。
+- 会话内容预览（看对话尾部）与选中会话导出为 JSON。
+- 规则化批量选择：`--older-than`、`--max-messages`，然后"选中匹配项"一键选中再删除。
+- 界面能做的所有事都有对应的命令行参数，既方便脚本化，也让全部逻辑可被测试覆盖。
 
 ## 安全性
 
@@ -83,11 +87,14 @@ mingw32-make clean
 - 按真实 schema 形态构造的删除级联（子表只带 `session_id` 列、却不声明外键）；
 - 数据库被占用时（删除必须明确报错，而不是静默成功）；
 - 共享视图模型：过滤（含 CJK 与 ASCII 大小写折叠）、每个排序字段与方向、tie-break 的确定性，以及构建视图不会改动输入数据；
+- 数据库维护模块：空间报告、压缩**计划**（并验证"做计划"是只读的）、孤儿事件删除、计划应用、VACUUM、会话预览与 JSON 导出；
 - 孤儿 diff 清理、UTF-8 安全截断、续接命令行参数校验。
 
 ```
-96 checks, 0 failed
+133 checks, 0 failed
 ```
+
+每次推送都会由 GitHub Actions 构建 TUI、GUI 并跑测试（`.github/workflows/build.yml`）。
 
 另外提供了一个用于检查真实数据库的辅助模式：
 
@@ -126,7 +133,7 @@ dist\opencode-session-manager-gui.exe
 | `Space` | 切换选择 |
 | `Ctrl+A` | 全选当前可见行 |
 | `Ctrl+D` | 清空选择 |
-| `Tab` | 切换视图（会话 / 快照） |
+| `Tab` | 切换视图（会话 / 快照 / 数据库） |
 | `F5` | 重新加载数据 |
 | `/` | 过滤（边打边筛，`Enter` 应用，`Esc` 取消） |
 | `s` / `S` | 循环切换排序字段 / 反转排序方向 |
@@ -135,10 +142,14 @@ dist\opencode-session-manager-gui.exe
 | `o` | 在新控制台中续接光标所在会话 |
 | `r` | 在资源管理器中定位工作树 / 快照目录 |
 | `O` | 快照视图：只看孤儿目录 |
+| `p` | 会话视图：预览该会话尾部内容 |
+| `e` | 把选中的会话导出为 JSON |
 | `x` | 立即清理孤儿 `session_diff` 文件 |
 | `Ctrl+E` | 切换"退出时清理" |
 | `Esc` | 有过滤时先清过滤，否则退出 |
 | `q` | 退出 |
+
+数据库视图按键：`r` 扫描、`c` 分析事件日志（dry-run）、`x` 清理孤儿事件、`b` 压缩（先备份）、`v` VACUUM，`j`/`k`/`PgUp`/`PgDn` 滚动。
 
 顶部状态行会显示"已过滤/总行数"、当前排序方式，以及孤儿快照目录占用的空间。快照体积是分批测量的，数据目录很大时界面依然流畅（测量期间显示 `sizing...`，未算完的行显示 `...`）。
 
@@ -163,17 +174,66 @@ opencode-session-manager.exe --list --filter nixStats --sort msgs
 | `--sort <字段>` | `created`、`updated`、`msgs`、`size`、`status`、`id`、`name`、`project` |
 | `--asc` | 升序（默认降序） |
 | `--limit <n>` | 最多打印 n 行 |
+| `--older-than <days>` | 只列出创建时间早于 n 天的会话 |
+| `--max-messages <n>` | 只列出消息数不超过 n 的会话 |
+| `--preview <id>` | 打印某个会话的尾部内容 |
+| `--export <dir>` | 把列出的会话导出为 JSON 文件 |
 | `--cleanup` | 界面退出后顺便清理孤儿 `session_diff` 文件 |
 | `--no-recycle` | 永久删除，不使用回收站 |
 | `--version` | 打印版本号后退出 |
 
+## 数据库维护
+
+上面那些功能清理的是会话、快照和 diff——在一台真实机器上通常只有几 MB。之所以要有**数据库视图**，是因为磁盘几乎总是被别的东西吃掉了：
+
+```
+$ opencode-session-manager --db-report
+database file   : 4.4G  (1141873 pages x 4096 bytes)
+  free pages    : 214M   <- reclaimable by VACUUM
+largest tables (estimated from content bytes when dbstat is unavailable):
+  event                       3.6G
+  part                        57.6M
+event log 3.6G (232110 rows) by type:
+  message.part.updated.1    191168 rows      3.6G
+  message.updated.1          31481 rows     86.4M
+```
+
+`event` 是 opencode 的 append-only 事件日志，而 `message.part.updated.1` 会在**每次更新时把整个 part 的完整快照再存一份**——上面这个库里**单个 part 有 87,121 个版本**，自己就占了 2.8 GB。删除会话完全不会碰这些行，所以文件永远不缩小。
+
+三种手段，按胆量递增：
+
+| 操作 | 做什么 | 安全性 |
+|------|--------|--------|
+| `--clean-orphan-events` | 删除所属会话已不存在的 event 行 | 安全：聚合已经没了，没有任何东西会回放它 |
+| `--compact-events` | 每个 part 只保留最新版本 | **会重写事件日志。** 默认 dry-run；要执行必须提供备份 |
+| `--vacuum` | 重写文件，把空闲页还给文件系统 | 需要约等于文件大小的临时空间，耗时数分钟；先关掉 opencode |
+
+```bat
+rem 先看清空间去向（只读）
+opencode-session-manager.exe --db-report
+
+rem 先回收确定无疑的垃圾，再压缩，最后缩小文件
+opencode-session-manager.exe --clean-orphan-events --yes
+opencode-session-manager.exe --compact-events                      rem dry run
+opencode-session-manager.exe --compact-events --yes --backup D:\opencode.db.bak
+opencode-session-manager.exe --vacuum --yes
+```
+
+关于压缩的几点说明（它是唯一会改动 opencode 数据的操作）：
+
+- **不加 `--yes` 就只是 dry-run**；而加 `--yes` 时必须同时给 `--backup <文件>`。GUI 里执行前也总是先自动备份。
+- 读不出 part id 的行（体积超大的那些）**永远不会被删除**。
+- 它按 `seq` 保留最新版本，所以每个 part 的最终状态都被完整保留。至于 opencode 的回放能否接受旧版本被删掉，只能拿结果去跑一次 opencode 才能证明——这正是备份不可选的原因。
+- 两个前端共用同一份实现，并且都作为**后台任务**执行、带进度显示，所以几分钟的 VACUUM 不会把界面卡死。
+
 ### GUI 使用说明
 
-- **View** 按钮切换会话 / 快照；菜单栏显示总数以及孤儿快照目录占用空间。
-- 工具栏：**Refresh**、**Select All**、**Clear Sel**、**Delete Selected**、**Clean orphan diffs**、**Cleanup on exit** 复选框、搜索框、**Orphans only** 筛选，以及字号控件。
+- **View** 按钮切换会话 / 快照 / 数据库；菜单栏显示总数以及孤儿快照目录占用空间。
+- 工具栏：**Refresh**、**Select All**、**Clear Sel**、**Delete Selected**、**Clean orphan diffs**、**Cleanup on exit** 复选框、搜索框、**Orphans only** 筛选、规则化选择（`Older than [n] days`、`max msgs`、**Select matching**）、**Preview** 开关，以及字号控件。
 - 点击表头排序（默认：会话按创建时间，快照按体积从大到小——这也是打开这个工具最常见的目的）。
 - 快捷键：`F5` 刷新，`Del` 删除所选，`Ctrl+A` 全选，`Ctrl+D` 清空选择，`Ctrl+F` 聚焦搜索框，`Ctrl++` / `Ctrl+-` / `Ctrl+0` 调整字号，`Esc` 清除搜索 / 选择。
 - 每行操作：**copy**（复制续接命令）、**jump**（在新控制台续接）、**dir** / **open**（在资源管理器中定位）。
+- **Database** 页有扫描按钮和三种维护操作，每个都带确认框，并在后台带进度条执行。
 - **字号**可在工具栏调整（`Text: 24 px  -  +  reset`），设置保存在 `%APPDATA%\opencode-session-manager\settings.ini`。默认值与旧版本渲染出来的观感一致——详见下节。
 
 ### 关于字号与 DPI 的说明

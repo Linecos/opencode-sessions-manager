@@ -17,6 +17,10 @@ set INCS=-I"%IMGUI%" -I"%IMGUI%\backends" -I"%MINGW_OPT%\include"
 set LIBS=-L"%MINGW_OPT%\lib" -lsqlite3 -lopengl32 -ldwmapi -luser32 -lgdi32 -lshell32 -lole32
 set OUT=dist
 
+rem Set OPENCODE_NO_STATIC=1 when linking against shared libraries.
+set STATIC_FLAG=-static
+if "%OPENCODE_NO_STATIC%"=="1" set STATIC_FLAG=
+
 if not exist "%GCC%.exe" (
     echo g++ not found at "%GCC%.exe"
     echo Set MINGW_ROOT to your MinGW-w64 installation, e.g. set MINGW_ROOT=D:\msys64\ucrt64
@@ -28,8 +32,8 @@ if not exist "%OUT%" mkdir "%OUT%"
 %WINDRES% resource.rc -O coff -o "%OUT%\resource.o"
 if errorlevel 1 goto :fail
 
-%GCC% -std=c++17 -O2 -Wall -static %INCS% ^
-    main_gui.cpp opencode_data.cpp session_view.cpp ^
+%GCC% -std=c++17 -O2 -Wall %STATIC_FLAG% %INCS% ^
+    main_gui.cpp opencode_data.cpp session_view.cpp db_maintenance.cpp ^
     "%IMGUI%\imgui.cpp" "%IMGUI%\imgui_draw.cpp" "%IMGUI%\imgui_tables.cpp" "%IMGUI%\imgui_widgets.cpp" ^
     "%IMGUI%\backends\imgui_impl_win32.cpp" "%IMGUI%\backends\imgui_impl_opengl3.cpp" ^
     "%OUT%\resource.o" %LIBS% -mwindows -o "%OUT%\opencode-session-manager-gui.exe"

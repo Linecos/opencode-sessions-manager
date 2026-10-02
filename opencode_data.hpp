@@ -35,6 +35,7 @@ std::vector<string> list_child_files(const string& p);
 string file_extension(const string& path);
 string file_stem(const string& path);
 long long total_dir_size(const string& p);
+long long file_size(const string& p);   // 0 when missing
 
 // Both of these throw std::runtime_error on failure (nothing is silently
 // swallowed any more).  See "Deletion policy" below for where the data goes.

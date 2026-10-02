@@ -39,14 +39,17 @@
 #endif
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "opencode_data.hpp"
+#include "db_maintenance.hpp"
 #include "session_view.hpp"
 #include "version.h"
 
@@ -96,8 +99,12 @@ static void utf8_pop_back(string& s) {
 // ---------------------------------------------------------------------------
 enum {
     TAB_SESSIONS = 0,
-    TAB_SNAPSHOTS = 1
+    TAB_SNAPSHOTS = 1,
+    TAB_DATABASE = 2
 };
+
+// Database maintenance actions that need a y/n confirmation first.
+enum { MA_NONE = 0, MA_CLEAN_ORPHANS, MA_COMPACT, MA_VACUUM };
 
 // Which fields the 's' key cycles through, per view.
 static const SortField kSessionSortFields[] = {SORT_CREATED, SORT_UPDATED, SORT_MESSAGES,
@@ -142,32 +149,41 @@ public:
     string message;
     bool running = true;
 
+    // database maintenance (the same background job the GUI uses)
+    MaintenanceJob job;
+    bool job_seen = true;
+    int db_scroll = 0;
+    int pending_action = MA_NONE;
+    bool preview_mode = false;
+    int preview_scroll = 0;
+    std::vector<PreviewMessage> preview;
+    string preview_for;
+    string preview_error;
+
     void run() {
-        try {
-            init_tui();
-            refresh_data(false);
-            while (running) {
-                draw();
-                // Poll while sizes are still being measured so the scan can make
-                // progress without the user having to press a key.
-                if (scan_pending) {
-                    timeout(50);
-                    int key = getch();
-                    if (key == ERR) {
-                        pump_sizes(SIZE_SCAN_PER_PUMP);
-                        continue;
-                    }
-                    handle_key(key);
-                } else {
-                    timeout(-1);
-                    handle_key(getch());
+        init_tui();
+        refresh_data(false);
+        while (running) {
+            draw();
+            // Poll while sizes or a maintenance job are still running, so both
+            // make progress without the user having to press a key.
+            bool busy = scan_pending > 0 || job.running();
+            if (preview_mode || pending_action != MA_NONE) busy = false;
+            if (busy) {
+                timeout(50);
+                int key = getch();
+                if (key == ERR) {
+                    if (scan_pending) pump_sizes(SIZE_SCAN_PER_PUMP);
+                    check_job();
+                    continue;
                 }
+                handle_key(key);
+            } else {
+                timeout(-1);
+                handle_key(getch());
             }
-        } catch (const std::exception& e) {
-            cleanup_screen();
-            fprintf(stderr, "Error: %s\n", e.what());
-            throw;
         }
+        job.wait();   // never leave a worker mid-flight
         cleanup_screen();
     }
 
@@ -191,6 +207,274 @@ private:
     }
 
     void cleanup_screen() { endwin(); }
+
+    // -----------------------------------------------------------------------
+    // Background maintenance
+    // -----------------------------------------------------------------------
+    static string timestamp_string() {
+        time_t now = time(nullptr);
+        struct tm tmv;
+#ifdef _WIN32
+        localtime_s(&tmv, &now);
+#else
+        localtime_r(&now, &tmv);
+#endif
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%04d%02d%02d-%02d%02d%02d", tmv.tm_year + 1900, tmv.tm_mon + 1,
+                 tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        return buf;
+    }
+
+    void check_job() {
+        if (job.running() || job_seen) return;
+        JobStatus st = job.status();
+        job_seen = true;
+        if (!st.ok && !st.error.empty()) {
+            message = "Error: " + utf8_ellipsize(st.error, 120);
+            return;
+        }
+        char buf[256];
+        switch (st.type) {
+        case JobType::Report:
+            message = "Database scan finished (j/k or PgUp/PgDn to scroll).";
+            break;
+        case JobType::CleanupOrphans:
+            snprintf(buf, sizeof(buf), "Removed %d orphan event row(s) (%s). Press v to VACUUM.",
+                     (int)st.result.rows, wide_to_utf8(format_size(st.result.bytes)).c_str());
+            message = buf;
+            refresh_data(true);
+            break;
+        case JobType::CompactEvents:
+            if (st.result.rows > 0) {
+                snprintf(buf, sizeof(buf), "Compacted %d row(s) (%s). Press v to VACUUM.",
+                         (int)st.result.rows,
+                         wide_to_utf8(format_size(st.result.bytes)).c_str());
+                refresh_data(true);
+            } else {
+                snprintf(buf, sizeof(buf), "Dry run: %d of %d rows redundant, %s reclaimable.",
+                         (int)st.plan.removable_rows, (int)st.plan.total_rows,
+                         wide_to_utf8(format_size(st.plan.removable_bytes)).c_str());
+            }
+            message = buf;
+            break;
+        case JobType::Vacuum:
+            snprintf(buf, sizeof(buf), "VACUUM: %s -> %s (freed %s)",
+                     wide_to_utf8(format_size(st.result.file_before)).c_str(),
+                     wide_to_utf8(format_size(st.result.file_after)).c_str(),
+                     wide_to_utf8(format_size(st.result.bytes)).c_str());
+            message = buf;
+            break;
+        case JobType::Backup:
+            snprintf(buf, sizeof(buf), "Backup written (%s)",
+                     wide_to_utf8(format_size(st.result.bytes)).c_str());
+            message = buf;
+            break;
+        default:
+            break;
+        }
+    }
+
+    void start_action(int action) {
+        switch (action) {
+        case MA_CLEAN_ORPHANS:
+            job.start(JobType::CleanupOrphans, DB_PATH);
+            break;
+        case MA_COMPACT: {
+            // Always back up first from the interactive UI: this rewrites the log.
+            string backup = DB_PATH + ".backup-" + timestamp_string();
+            job.start(JobType::CompactEvents, DB_PATH, backup);
+            message = "Compacting (backup: " + backup + ")";
+            break;
+        }
+        case MA_VACUUM:
+            if (database_is_busy(DB_PATH)) {
+                message = "Error: database is locked (is opencode running?).";
+                return;
+            }
+            job.start(JobType::Vacuum, DB_PATH);
+            break;
+        default:
+            return;
+        }
+        job_seen = false;
+    }
+
+    void export_selected() {
+        std::vector<string> ids(selected.begin(), selected.end());
+        if (ids.empty()) {
+            message = "Nothing selected to export.";
+            return;
+        }
+        string dir = path_join(data_dir(), "export-" + timestamp_string());
+        std::vector<string> written;
+        string err;
+        if (export_sessions_json(DB_PATH, ids, dir, &written, &err))
+            message = "Exported " + std::to_string(written.size()) + " session(s) to " + dir;
+        else
+            message = "Error: " + err;
+    }
+
+    void load_preview_now() {
+        preview.clear();
+        preview_error.clear();
+        preview_for.clear();
+        if (tab != TAB_SESSIONS) return;
+        string id = key_at(cursor);
+        if (id.empty()) return;
+        preview_for = id;
+        try {
+            preview = load_session_preview(DB_PATH, id, 30);
+        } catch (const std::exception& e) {
+            preview_error = e.what();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Database view
+    // -----------------------------------------------------------------------
+    bool handle_database_key(int key) {
+        switch (key) {
+        case 'r':
+            job.start(JobType::Report, DB_PATH);
+            job_seen = false;
+            message = "Scanning database (read-only)...";
+            return true;
+        case 'c':
+            job.start(JobType::CompactEvents, DB_PATH);
+            job_seen = false;
+            message = "Analysing event log (dry run)...";
+            return true;
+        case 'x':
+            pending_action = MA_CLEAN_ORPHANS;
+            return true;
+        case 'b':
+            pending_action = MA_COMPACT;
+            return true;
+        case 'v':
+            pending_action = MA_VACUUM;
+            return true;
+        case KEY_DOWN:
+        case 'j':
+            db_scroll++;
+            return true;
+        case KEY_UP:
+        case 'k':
+            if (db_scroll > 0) db_scroll--;
+            return true;
+        case KEY_NPAGE:
+            db_scroll += page_rows;
+            return true;
+        case KEY_PPAGE:
+            db_scroll -= page_rows;
+            if (db_scroll < 0) db_scroll = 0;
+            return true;
+        case KEY_HOME:
+            db_scroll = 0;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    void draw_database_view(int start_y, int end_y, int w) {
+        JobStatus st = job.status();
+        std::vector<wstring> lines;
+        const DbReport& r = st.report;
+
+        auto add = [&](const wstring& s) { lines.push_back(s); };
+        auto addf = [&](const char* fmt, ...) {
+            char buf[512];
+            va_list ap;
+            va_start(ap, fmt);
+            vsnprintf(buf, sizeof(buf), fmt, ap);
+            va_end(ap);
+            lines.push_back(utf8_to_wide(buf));
+        };
+        auto sz = [](long long b) { return wide_to_utf8(format_size(b)); };
+
+        if (st.running) {
+            addf("  %s  [%d%%]", st.stage.c_str(), st.percent);
+            add(L"");
+        }
+
+        if (r.file_bytes <= 0) {
+            add(L"  Press r to scan the database (read-only, takes a minute on a big file).");
+            add(L"");
+            add(L"  In a real opencode database 90%+ of the file can be the append-only");
+            add(L"  `event` log: it stores a complete snapshot of a message part on every");
+            add(L"  update, and deleting sessions does not touch those rows - which is why");
+            add(L"  the file never shrinks.");
+            add(L"");
+            add(L"  r  scan                    c  analyse event log (dry run)");
+            add(L"  x  clean orphan events     b  compact (always backs up first)");
+            add(L"  v  VACUUM");
+        } else {
+            add(L"  database file    " + utf8_to_wide(sz(r.file_bytes)) + L"   (" +
+                std::to_wstring(r.page_count) + L" pages x " + std::to_wstring(r.page_size) +
+                L" B)");
+            add(L"  free pages       " + utf8_to_wide(sz(r.free_bytes)) + L"   <- VACUUM (v)");
+            add(L"  event log        " + utf8_to_wide(sz(r.event_bytes)) + L"   (" +
+                std::to_wstring(r.event_rows) + L" rows)");
+            add(L"  session/message/part rows: " + std::to_wstring(r.session_rows) + L" / " +
+                std::to_wstring(r.message_rows) + L" / " + std::to_wstring(r.part_rows));
+            add(L"");
+            add(L"  orphan events (deleted sessions)  " + utf8_to_wide(sz(r.orphan_event_bytes)) +
+                L"  (" + std::to_wstring(r.orphan_event_rows) + L" rows)   -> x");
+            add(L"  safe to reclaim now               " + utf8_to_wide(sz(r.reclaimable_safe())));
+            add(L"");
+
+            add(L"  largest tables" + wstring(r.dbstat_available ? L" (dbstat)" : L" (estimated)"));
+            for (size_t i = 0; i < r.tables.size() && i < 8; ++i)
+                addf("    %-26s %10s", r.tables[i].name.c_str(), sz(r.tables[i].bytes).c_str());
+            add(L"");
+            add(L"  event log by type");
+            for (size_t i = 0; i < r.event_types.size() && i < 8; ++i)
+                addf("    %-26s %8d rows %10s", r.event_types[i].name.c_str(),
+                     (int)r.event_types[i].rows, sz(r.event_types[i].bytes).c_str());
+            add(L"");
+            add(L"  top sessions by event footprint");
+            for (size_t i = 0; i < r.sessions.size() && i < 8; ++i)
+                addf("    %-30s %8d rows %10s  %s", utf8_ellipsize(r.sessions[i].name, 30).c_str(),
+                     (int)r.sessions[i].rows, sz(r.sessions[i].bytes).c_str(),
+                     utf8_ellipsize(r.sessions[i].extra, 28).c_str());
+            if (!r.big_items.empty()) {
+                add(L"");
+                add(L"  oversized objects");
+                for (size_t i = 0; i < r.big_items.size(); ++i)
+                    addf("    %-50s %10s", utf8_ellipsize(r.big_items[i].name, 50).c_str(),
+                         sz(r.big_items[i].bytes).c_str());
+            }
+        }
+
+        if (st.plan.total_rows > 0) {
+            add(L"");
+            add(L"  event log compaction (dry run)");
+            addf("    %d of %d part.updated rows are redundant, %s reclaimable",
+                 (int)st.plan.removable_rows, (int)st.plan.total_rows,
+                 sz(st.plan.removable_bytes).c_str());
+            if (!st.plan.worst_parts.empty())
+                addf("    worst part: %s with %d versions", st.plan.worst_parts[0].name.c_str(),
+                     (int)st.plan.worst_parts[0].rows);
+            add(L"    b = apply (a backup is taken first)");
+        }
+
+        int visible = end_y - start_y;
+        if (visible < 1) visible = 1;
+        int max_scroll = (int)lines.size() - visible;
+        if (max_scroll < 0) max_scroll = 0;
+        if (db_scroll > max_scroll) db_scroll = max_scroll;
+        if (db_scroll < 0) db_scroll = 0;
+
+        wattrset(stdscr, COLOR_PAIR(COLOR_DIM));
+        for (int i = 0; i < visible && (size_t)(db_scroll + i) < lines.size(); ++i) {
+            const wstring& line = lines[(size_t)(db_scroll + i)];
+            bool highlight = line.find(L"->") != wstring::npos;
+            if (highlight) wattrset(stdscr, COLOR_PAIR(COLOR_WARN));
+            mvwaddswstr(stdscr, start_y + i, 0, truncate(line, (size_t)w));
+            if (highlight) wattrset(stdscr, COLOR_PAIR(COLOR_DIM));
+        }
+        wattrset(stdscr, A_NORMAL);
+    }
 
     // -----------------------------------------------------------------------
     // Data
@@ -242,6 +526,12 @@ private:
     const string& active_filter() const { return filter_mode ? filter_edit : filter; }
 
     void rebuild_view() {
+        if (tab == TAB_DATABASE) {
+            view.clear();
+            cursor = 0;
+            scroll = 0;
+            return;
+        }
         ViewQuery q;
         q.filter = active_filter();
         q.orphans_only = orphans_only;
@@ -257,7 +547,10 @@ private:
         clamp_state();
     }
 
-    size_t total_rows() const { return tab == TAB_SESSIONS ? sessions.size() : snapshots.size(); }
+    size_t total_rows() const {
+        if (tab == TAB_DATABASE) return 0;
+        return tab == TAB_SESSIONS ? sessions.size() : snapshots.size();
+    }
     size_t visible_rows() const { return view.size(); }
 
     string key_at(int row) const {
@@ -295,6 +588,39 @@ private:
     void handle_key(int key) {
         if (key == ERR) return;
 
+        if (preview_mode) {
+            switch (key) {
+            case 'q':
+            case 27:
+            case 'p':
+                preview_mode = false;
+                break;
+            case KEY_DOWN:
+            case 'j':
+                preview_scroll++;
+                break;
+            case KEY_UP:
+            case 'k':
+                if (preview_scroll > 0) preview_scroll--;
+                break;
+            case KEY_NPAGE:
+                preview_scroll += page_rows;
+                break;
+            case KEY_PPAGE:
+                preview_scroll -= page_rows;
+                if (preview_scroll < 0) preview_scroll = 0;
+                break;
+            default:
+                break;
+            }
+            return;
+        }
+        if (pending_action != MA_NONE) {
+            int action = pending_action;
+            pending_action = MA_NONE;
+            if (key == 'y' || key == 'Y') start_action(action);
+            return;
+        }
         if (filter_mode) {
             handle_filter_key(key);
             return;
@@ -304,6 +630,8 @@ private:
             confirm_mode = false;
             return;
         }
+
+        if (tab == TAB_DATABASE && handle_database_key(key)) return;
 
         switch (key) {
         case 'q':
@@ -319,12 +647,24 @@ private:
                 running = false;
             }
             break;        case '\t':
-            tab = 1 - tab;
+            tab = (tab + 1) % 3;
             selected.clear();
             cursor = 0;
             scroll = 0;
             message.clear();
             rebuild_view();
+            break;
+        case 'p':
+            if (tab == TAB_SESSIONS) {
+                preview_mode = true;
+                preview_scroll = 0;
+                load_preview_now();
+            } else {
+                message = "Preview is only available for sessions.";
+            }
+            break;
+        case 'e':
+            export_selected();
             break;
         case KEY_UP:
         case 'k':
@@ -606,6 +946,7 @@ private:
         return tab == TAB_SESSIONS ? session_desc : snapshot_desc;
     }
     wstring sort_label() const {
+        if (tab == TAB_DATABASE) return L"-";
         return utf8_to_wide(sort_field_name(current_sort_field()));
     }
 
@@ -625,13 +966,16 @@ private:
         page_rows = visible > 1 ? visible - 1 : 1;
 
         if (tab == TAB_SESSIONS) draw_session_list(list_start_y, list_end_y, w);
-        else draw_snapshot_list(list_start_y, list_end_y, w);
+        else if (tab == TAB_SNAPSHOTS) draw_snapshot_list(list_start_y, list_end_y, w);
+        else draw_database_view(list_start_y, list_end_y, w);
 
         draw_info_line(h - 4, w);
         draw_help_lines(h - 3, w);              // occupies h-3 and h-2
         draw_message_line(h - 1, w);
 
         if (confirm_mode) draw_confirm_dialog(h, w);
+        if (pending_action != MA_NONE) draw_action_prompt(h, w);
+        if (preview_mode) draw_preview_overlay(h, w);
 
         wnoutrefresh(stdscr);
         doupdate();
@@ -647,11 +991,13 @@ private:
         wstring tab_s = buf;
         swprintf(buf, 128, L" Snapshots (%d) ", (int)snapshots.size());
         wstring tab_p = buf;
+        wstring tab_d = L" Database ";
 
         int off = 0;
-        struct TabLabel { const wstring& label; bool active; } tabs[2] = {
+        struct TabLabel { const wstring& label; bool active; } tabs[3] = {
             {tab_s, tab == TAB_SESSIONS},
-            {tab_p, tab == TAB_SNAPSHOTS}
+            {tab_p, tab == TAB_SNAPSHOTS},
+            {tab_d, tab == TAB_DATABASE}
         };
         for (auto& t : tabs) {
             wattrset(stdscr, t.active ? A_REVERSE : COLOR_PAIR(COLOR_DIM));
@@ -673,17 +1019,25 @@ private:
 
         wstring right;
         const string& shown = active_filter();
-        if (!shown.empty()) {
+        if (!shown.empty() && tab != TAB_DATABASE) {
             wstring f = utf8_to_wide(shown);
             if (f.size() > 24) f = truncate(f, 24);
             right += L"filter:\"" + f + L"\" ";
         }
-        swprintf(buf, 128, L"%d/%d  sort:%ls%ls  orphan:%d(%ls)%ls",
-                 (int)visible_rows(), (int)total_rows(), sort_label().c_str(),
-                 current_sort_desc() ? L"\u2193" : L"\u2191", (int)orphans,
-                 format_size(orphan_bytes).c_str(),
-                 sizes_pending ? L"  sizing..." : L"");
-        right += buf;
+        if (tab == TAB_DATABASE) {
+            JobStatus st = job.status();
+            if (st.running)
+                right += utf8_to_wide(std::to_string(st.percent) + "% " + st.stage);
+            else
+                right += L"r:scan  c:analyse  x:clean  b:compact  v:vacuum";
+        } else {
+            swprintf(buf, 128, L"%d/%d  sort:%ls%ls  orphan:%d(%ls)%ls",
+                     (int)visible_rows(), (int)total_rows(), sort_label().c_str(),
+                     current_sort_desc() ? L"\u2193" : L"\u2191", (int)orphans,
+                     format_size(orphan_bytes).c_str(),
+                     sizes_pending ? L"  sizing..." : L"");
+            right += buf;
+        }
 
         int x = w - (int)right.size();
         if (x > off) {
@@ -696,7 +1050,16 @@ private:
     void draw_info_line(int y, int w) {
         if (y < 0 || y >= LINES) return;
         string info;
-        if (tab == TAB_SESSIONS) {
+        if (tab == TAB_DATABASE) {
+            JobStatus st = job.status();
+            if (st.running)
+                info = "Working: " + st.stage + "  (" + std::to_string(st.percent) + "%)";
+            else if (st.finished && !st.error.empty())
+                info = "Last error: " + st.error;
+            else if (st.finished)
+                info = string("Last job: ") + job_type_name(st.type) + "  " +
+                       std::to_string((int)st.elapsed) + "s";
+        } else if (tab == TAB_SESSIONS) {
             if (!view.empty()) {
                 const Session& s = sessions[(size_t)view[(size_t)cursor]];
                 info = "Session ID: " + s.id;
@@ -731,10 +1094,16 @@ private:
             delwin(win);
         } else {
             wchar_t buf[160];
-            swprintf(buf, 160,
-                     L" up/down:Move  Space:Sel  ^A:All  ^D:None  /:Filter  s:Sort  "
-                     L"d:Del  c:Copy  o:Jump  Tab:View  F5:Reload  q:Quit | Sel %d/%d ",
-                     (int)selected.size(), (int)visible_rows());
+            if (tab == TAB_DATABASE)
+                swprintf(buf, 160,
+                         L" r:Scan  c:Analyse  x:Clean orphans  b:Compact(+backup)  v:VACUUM  "
+                         L"j/k:Scroll  Tab:View  q:Quit ");
+            else
+                swprintf(buf, 160,
+                         L" up/down:Move  Space:Sel  ^A:All  ^D:None  /:Filter  s:Sort  "
+                         L"d:Del  c:Copy  o:Jump  p:Preview  e:Export  Tab:View  F5:Reload  "
+                         L"q:Quit | Sel %d/%d ",
+                         (int)selected.size(), (int)visible_rows());
             WINDOW* win = derwin(stdscr, 1, w, y, 0);
             wbkgd(win, ' ' | COLOR_PAIR(COLOR_HELP));
             waddswstr(win, truncate(buf, (size_t)w));
@@ -930,23 +1299,102 @@ private:
         put(dialog_h - 2, L"[Y] Confirm    [N] Cancel");
         wattrset(stdscr, A_NORMAL);
     }
+
+    void draw_action_prompt(int h, int w) {
+        const wchar_t* text = L"";
+        switch (pending_action) {
+        case MA_CLEAN_ORPHANS:
+            text = L" Remove event rows of deleted sessions?  [Y] Yes  [N] Cancel ";
+            break;
+        case MA_COMPACT:
+            text = L" Compact the event log (backup first, then drop old versions)?  "
+                   L"[Y] Yes  [N] Cancel ";
+            break;
+        case MA_VACUUM:
+            text = L" Rewrite the database file to reclaim free pages?  [Y] Yes  [N] Cancel ";
+            break;
+        default:
+            return;
+        }
+        int y = h - 2;
+        if (y < 0 || y >= LINES) return;
+        wattrset(stdscr, COLOR_PAIR(COLOR_WARN) | A_BOLD);
+        mvwaddswstr(stdscr, y, 0, truncate(text, (size_t)w));
+        wattrset(stdscr, A_NORMAL);
+    }
+
+    void draw_preview_overlay(int h, int w) {
+        int box_h = h - 4;
+        int box_w = w - 4;
+        if (box_h < 4 || box_w < 20) return;
+        const int dy = 2, dx = 2;
+
+        wattrset(stdscr, COLOR_PAIR(COLOR_NORMAL));
+        for (int y = 0; y < box_h && dy + y < h; y++)
+            mvwaddswstr(stdscr, dy + y, dx, wstring((size_t)box_w, L' '));
+
+        wstring title = L" Preview: " + utf8_to_wide(preview_for) + L"   (" +
+                        std::to_wstring(preview.size()) +
+                        L" part(s))  -  j/k scroll, p/Esc close ";
+        wattrset(stdscr, COLOR_PAIR(COLOR_HEADER) | A_BOLD);
+        mvwaddswstr(stdscr, dy, dx, truncate(title, (size_t)box_w));
+
+        std::vector<wstring> lines;
+        if (!preview_error.empty()) lines.push_back(L"  Error: " + utf8_to_wide(preview_error));
+        for (auto& m : preview) {
+            lines.push_back(L"  [" + (m.role.empty() ? utf8_to_wide(m.kind) : utf8_to_wide(m.role)) +
+                            L"]  " + format_time(m.time_created));
+            wstring text = utf8_to_wide(m.text);
+            size_t per = (size_t)std::max(20, box_w - 8);
+            for (size_t i = 0; i < text.size(); i += per)
+                lines.push_back(L"      " + text.substr(i, per));
+        }
+        if (lines.empty()) lines.push_back(L"  (no parts recorded for this session)");
+
+        int visible = box_h - 1;
+        int max_scroll = (int)lines.size() - visible;
+        if (max_scroll < 0) max_scroll = 0;
+        if (preview_scroll > max_scroll) preview_scroll = max_scroll;
+        if (preview_scroll < 0) preview_scroll = 0;
+
+        wattrset(stdscr, COLOR_PAIR(COLOR_DIM));
+        for (int i = 0; i < visible && (size_t)(preview_scroll + i) < lines.size(); ++i)
+            mvwaddswstr(stdscr, dy + 1 + i, dx,
+                        truncate(lines[(size_t)(preview_scroll + i)], (size_t)box_w - 1));
+        wattrset(stdscr, A_NORMAL);
+    }
 };
 
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-// Headless listing mode. It renders the very same pipeline the interactive UI
-// uses (load -> filter -> sort -> format), which makes this both a scriptable
-// feature and the only way to exercise the TUI logic without a console.
-struct DumpOptions {
-    bool enabled = false;
+// Headless modes. They render the very same pipeline the interactive UI uses
+// (load -> filter -> sort -> format) plus the database maintenance operations,
+// which makes the tool scriptable and means everything can be exercised and
+// verified without a console.
+struct CliOptions {
+    // listing
+    bool list = false;
     bool snapshots = false;
     bool orphans_only = false;
     string filter;
     SortField field = SORT_CREATED;
     bool field_given = false;
     bool ascending = false;
-    long long limit = 0;      // 0 = no limit
+    long long limit = 0;             // 0 = no limit
+    long long older_than_days = 0;   // 0 = no age bound
+    long long max_messages = -1;     // -1 = no bound
+    // maintenance
+    bool db_report = false;
+    bool clean_orphans = false;
+    bool compact_events = false;
+    bool vacuum = false;
+    bool preview = false;
+    bool export_json = false;
+    bool yes = false;                // required to actually modify anything
+    string backup_path;
+    string preview_id;
+    string export_dir;
 };
 
 static bool parse_sort_field(const string& name, SortField* out) {
@@ -975,21 +1423,63 @@ static void print_usage() {
            "  --sort <field>       created|updated|msgs|size|status|id|name|project\n"
            "  --asc                sort ascending (default: descending)\n"
            "  --limit <n>          print at most n rows\n"
+           "  --older-than <days>  sessions not touched for that many days\n"
+           "  --max-messages <n>   sessions with at most n messages\n"
+           "\n"
+           "Database maintenance (read-only unless --yes is given):\n"
+           "  --db-report          show where the disk space goes, then exit\n"
+           "  --preview <id>       print the tail of a session, then exit\n"
+           "  --export <dir>       export the listed sessions as JSON\n"
+           "  --clean-orphan-events  drop event rows of deleted sessions\n"
+           "  --compact-events     keep only the newest snapshot of each part\n"
+           "  --vacuum             rewrite the database file to reclaim free pages\n"
+           "  --backup <path>      --compact-events: back up here before changing\n"
+           "  --yes                actually perform the change (otherwise: dry run)\n"
            "\n"
            "  --version            print the version and exit\n"
            "  --help               show this message\n");
 }
 
-static int run_list(const DumpOptions& o) {
+static void cli_progress(int percent, const std::string& stage) {
+    printf("\r  [%3d%%] %-64s", percent, utf8_ellipsize(stage, 64).c_str());
+    fflush(stdout);
+    if (percent >= 100) printf("\n");
+}
+
+static int run_list(const CliOptions& o) {
     ViewQuery q;
     q.filter = o.filter;
     q.orphans_only = o.orphans_only;
     q.descending = !o.ascending;
+    q.max_messages = o.max_messages;
+    if (o.older_than_days > 0) {
+        time_t now = time(nullptr);
+        q.created_before_ms = (long long)(now - (time_t)o.older_than_days * 24 * 3600) * 1000;
+    }
 
     if (!o.snapshots) {
         q.field = o.field_given ? o.field : SORT_CREATED;
         std::vector<Session> sessions = load_sessions(DB_PATH);
         std::vector<int> view = build_session_view(sessions, q);
+
+        // --export writes exactly the rows the listing would have shown
+        if (o.export_json) {
+            std::vector<string> ids;
+            for (int idx : view) ids.push_back(sessions[(size_t)idx].id);
+            if (ids.empty()) {
+                printf("Nothing to export.\n");
+                return 0;
+            }
+            std::vector<string> written;
+            string err;
+            if (!export_sessions_json(DB_PATH, ids, o.export_dir, &written, &err)) {
+                fprintf(stderr, "Export failed: %s\n", err.c_str());
+                return 1;
+            }
+            printf("Exported %d session(s) to %s\n", (int)written.size(), o.export_dir.c_str());
+            for (auto& w : written) printf("  %s\n", w.c_str());
+            return 0;
+        }
 
         long long shown = 0;
         for (int idx : view) {
@@ -1029,12 +1519,151 @@ static int run_list(const DumpOptions& o) {
     return 0;
 }
 
+static int run_db_report() {
+    DbReport r = analyze_database(DB_PATH, 12, cli_progress);
+    printf("\n");
+    printf("database file   : %s  (%d pages x %d bytes)\n",
+           wide_to_utf8(format_size(r.file_bytes)).c_str(), (int)r.page_count, (int)r.page_size);
+    printf("  free pages    : %s   <- reclaimable by VACUUM\n",
+           wide_to_utf8(format_size(r.free_bytes)).c_str());
+    printf("  rows          : session %d, message %d, part %d, event %d\n", (int)r.session_rows,
+           (int)r.message_rows, (int)r.part_rows, (int)r.event_rows);
+    printf("\nlargest tables (%s):\n",
+           r.dbstat_available ? "exact, from dbstat" : "estimated from content bytes");
+    for (auto& t : r.tables)
+        printf("  %-28s %12s\n", t.name.c_str(), wide_to_utf8(format_size(t.bytes)).c_str());
+    printf("\nevent log %s (%d rows) by type:\n", wide_to_utf8(format_size(r.event_bytes)).c_str(),
+           (int)r.event_rows);
+    for (auto& t : r.event_types)
+        printf("  %-28s %8d rows %12s\n", t.name.c_str(), (int)t.rows,
+               wide_to_utf8(format_size(t.bytes)).c_str());
+    printf("\ntop sessions by event footprint:\n");
+    for (auto& t : r.sessions)
+        printf("  %-32s %8d rows %12s   %s\n", utf8_ellipsize(t.name, 32).c_str(), (int)t.rows,
+               wide_to_utf8(format_size(t.bytes)).c_str(), t.extra.c_str());
+    printf("\nreclaimable:\n");
+    printf("  orphan events (deleted sessions) %8d rows %12s   <- safe: --clean-orphan-events\n",
+           (int)r.orphan_event_rows, wide_to_utf8(format_size(r.orphan_event_bytes)).c_str());
+    printf("  free pages                               %12s   <- --vacuum\n",
+           wide_to_utf8(format_size(r.free_bytes)).c_str());
+    printf("  total safe to reclaim                    %12s\n",
+           wide_to_utf8(format_size(r.reclaimable_safe())).c_str());
+    if (!r.big_items.empty()) {
+        printf("\noversized objects worth a look:\n");
+        for (auto& t : r.big_items)
+            printf("  %-58s %12s\n", utf8_ellipsize(t.name, 58).c_str(),
+                   wide_to_utf8(format_size(t.bytes)).c_str());
+    }
+    printf("\nhint: --compact-events reclaims much more (dry run unless you add --yes)\n");
+    return 0;
+}
+
+static int run_preview(const CliOptions& o) {
+    auto msgs = load_session_preview(DB_PATH, o.preview_id, 20);
+    if (msgs.empty()) {
+        printf("No parts found for %s\n", o.preview_id.c_str());
+        return 1;
+    }
+    printf("Last %d part(s) of session %s:\n\n", (int)msgs.size(), o.preview_id.c_str());
+    for (auto& m : msgs) {
+        printf("  [%s] %s\n", m.role.empty() ? m.kind.c_str() : m.role.c_str(),
+               wide_to_utf8(format_time(m.time_created)).c_str());
+        printf("      %s\n", m.text.c_str());
+    }
+    return 0;
+}
+
+static int run_clean_orphans(const CliOptions& o) {
+    if (!o.yes) {
+        printf("Dry run (add --yes to apply).\n\n");
+        DbReport r = analyze_database(DB_PATH, 3, cli_progress);
+        printf("\nwould remove %d orphan event rows, about %s (they belong to sessions that are gone)\n",
+               (int)r.orphan_event_rows, wide_to_utf8(format_size(r.orphan_event_bytes)).c_str());
+        printf("The file only shrinks after a --vacuum.\n");
+        return 0;
+    }
+    ReclaimResult r = delete_orphan_events(DB_PATH, cli_progress);
+    printf("\nremoved %d rows, about %s\n", (int)r.rows,
+           wide_to_utf8(format_size(r.bytes)).c_str());
+    printf("file size: %s -> %s\n", wide_to_utf8(format_size(r.file_before)).c_str(),
+           wide_to_utf8(format_size(r.file_after)).c_str());
+    return 0;
+}
+
+static int run_compact(const CliOptions& o) {
+    CompactionPlan plan = plan_event_compaction(DB_PATH, cli_progress);
+    printf("\n");
+    printf("message.part.updated.1: %d rows / %s across %d parts\n", (int)plan.total_rows,
+           wide_to_utf8(format_size(plan.total_bytes)).c_str(), (int)plan.parts);
+    printf("redundant versions    : %d rows / %s\n", (int)plan.removable_rows,
+           wide_to_utf8(format_size(plan.removable_bytes)).c_str());
+    if (plan.skipped_rows)
+        printf("skipped (unreadable)  : %d rows (never deleted)\n", (int)plan.skipped_rows);
+    if (!plan.worst_parts.empty()) {
+        printf("\nparts with the most versions:\n");
+        for (auto& p : plan.worst_parts)
+            printf("  %-34s %8d versions %12s\n", p.name.c_str(), (int)p.rows,
+                   wide_to_utf8(format_size(p.bytes)).c_str());
+    }
+    if (!o.yes) {
+        printf("\nDry run: nothing was modified.\n");
+        printf("To apply: --compact-events --yes --backup <file>\n");
+        printf("Note: this rewrites the opencode event log. Back it up first.\n");
+        return 0;
+    }
+    if (o.backup_path.empty()) {
+        fprintf(stderr,
+                "--compact-events --yes refuses to run without --backup <file>:\n"
+                "it rewrites the opencode event log.\n");
+        return 2;
+    }
+    printf("\nBacking up to %s ...\n", o.backup_path.c_str());
+    long long copied = 0;
+    string err;
+    if (!backup_database(DB_PATH, o.backup_path, &copied, &err)) {
+        fprintf(stderr, "Backup failed: %s\n", err.c_str());
+        return 1;
+    }
+    printf("Backup complete (%s)\n\n", wide_to_utf8(format_size(copied)).c_str());
+    ReclaimResult r = apply_event_compaction(DB_PATH, plan, cli_progress);
+    printf("\nremoved %d rows, about %s\n", (int)r.rows,
+           wide_to_utf8(format_size(r.bytes)).c_str());
+    printf("file size: %s -> %s (run --vacuum to release it)\n",
+           wide_to_utf8(format_size(r.file_before)).c_str(),
+           wide_to_utf8(format_size(r.file_after)).c_str());
+    return 0;
+}
+
+static int run_vacuum(const CliOptions& o) {
+    if (!o.yes) {
+        DbReport r = analyze_database(DB_PATH, 3, cli_progress);
+        printf("\nDry run: %s of free pages can be reclaimed.\n",
+               wide_to_utf8(format_size(r.free_bytes)).c_str());
+        printf("VACUUM needs temp space about the size of the database and takes a few minutes.\n");
+        printf("To apply: --vacuum --yes (it fails while opencode is running)\n");
+        return 0;
+    }
+    if (database_is_busy(DB_PATH)) {
+        fprintf(stderr, "The database is locked (opencode is probably running) - close it first.\n");
+        return 1;
+    }
+    ReclaimResult r;
+    if (!vacuum_database(DB_PATH, &r, cli_progress)) {
+        fprintf(stderr, "VACUUM failed: %s\n", r.error.c_str());
+        return 1;
+    }
+    printf("\nfile size: %s -> %s (freed %s)\n", wide_to_utf8(format_size(r.file_before)).c_str(),
+           wide_to_utf8(format_size(r.file_after)).c_str(),
+           wide_to_utf8(format_size(r.bytes)).c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
     bool cleanup_on_exit = false;
-    DumpOptions dump;
+    CliOptions opt;
 
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
@@ -1046,34 +1675,55 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
 
-        if (a == "--list") {
-            dump.enabled = true;
-        } else if (a == "--snapshots") {
-            dump.snapshots = true;
-        } else if (a == "--orphans") {
-            dump.orphans_only = true;
-        } else if (a == "--asc") {
-            dump.ascending = true;
-        } else if (a == "--cleanup") {
-            cleanup_on_exit = true;
-        } else if (a == "--no-recycle") {
-            set_delete_to_recycle(false);
-        } else if (a == "--filter") {
+        if (a == "--list") opt.list = true;
+        else if (a == "--snapshots") opt.snapshots = true;
+        else if (a == "--orphans") opt.orphans_only = true;
+        else if (a == "--asc") opt.ascending = true;
+        else if (a == "--yes") opt.yes = true;
+        else if (a == "--cleanup") cleanup_on_exit = true;
+        else if (a == "--no-recycle") set_delete_to_recycle(false);
+        else if (a == "--db-report") opt.db_report = true;
+        else if (a == "--clean-orphan-events") opt.clean_orphans = true;
+        else if (a == "--compact-events") opt.compact_events = true;
+        else if (a == "--vacuum") opt.vacuum = true;
+        else if (a == "--filter") {
             const char* v = need_value("--filter");
             if (!v) return 2;
-            dump.filter = v;
+            opt.filter = v;
         } else if (a == "--limit") {
             const char* v = need_value("--limit");
             if (!v) return 2;
-            dump.limit = atoll(v);
+            opt.limit = atoll(v);
+        } else if (a == "--older-than") {
+            const char* v = need_value("--older-than");
+            if (!v) return 2;
+            opt.older_than_days = atoll(v);
+        } else if (a == "--max-messages") {
+            const char* v = need_value("--max-messages");
+            if (!v) return 2;
+            opt.max_messages = atoll(v);
+        } else if (a == "--backup") {
+            const char* v = need_value("--backup");
+            if (!v) return 2;
+            opt.backup_path = v;
+        } else if (a == "--preview") {
+            const char* v = need_value("--preview");
+            if (!v) return 2;
+            opt.preview = true;
+            opt.preview_id = v;
+        } else if (a == "--export") {
+            const char* v = need_value("--export");
+            if (!v) return 2;
+            opt.export_json = true;
+            opt.export_dir = v;
         } else if (a == "--sort") {
             const char* v = need_value("--sort");
             if (!v) return 2;
-            if (!parse_sort_field(v, &dump.field)) {
+            if (!parse_sort_field(v, &opt.field)) {
                 fprintf(stderr, "Unknown sort field: %s\n", v);
                 return 2;
             }
-            dump.field_given = true;
+            opt.field_given = true;
         } else if (a == "--version" || a == "-V") {
             printf("opencode-session-manager %s\n", OPENCODE_SM_VERSION_STRING);
             return 0;
@@ -1093,11 +1743,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (dump.enabled) {
+    // Headless modes, ordered from least to most destructive.
+    if (opt.list || opt.export_json || opt.preview || opt.db_report || opt.clean_orphans ||
+        opt.compact_events || opt.vacuum) {
         try {
-            return run_list(dump);
+            if (opt.preview) return run_preview(opt);
+            if (opt.db_report) return run_db_report();
+            if (opt.clean_orphans) return run_clean_orphans(opt);
+            if (opt.compact_events) return run_compact(opt);
+            if (opt.vacuum) return run_vacuum(opt);
+            return run_list(opt);
         } catch (const std::exception& e) {
-            fprintf(stderr, "Error: %s\n", e.what());
+            fprintf(stderr, "\nError: %s\n", e.what());
             return 1;
         }
     }
