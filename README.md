@@ -176,7 +176,8 @@ Database view keys: `r` scan, `c` analyse the event log (dry run), `x` clean orp
 
 The header line shows the filtered/total row count, the active sort and how much space the orphan
 snapshot directories hold. Snapshot sizes are measured a few directories at a time, so the UI stays
-responsive on large data directories (it shows `sizing...` meanwhile, and `...` per row).
+responsive on large data directories; while that runs, a progress bar on the line under the tab bar
+shows the percentage and how many directories are left (`...` marks rows whose size is not known yet).
 
 ### Headless listing
 
@@ -259,6 +260,12 @@ Notes on compaction, since it is the one that rewrites opencode's data:
   against the result — which is exactly why the backup is not optional.
 - Both front ends share one implementation and run these as background jobs with progress, so a
   multi-minute VACUUM never freezes the window.
+- The space scan is **one sequential pass** over the event log with the folding done in C++ instead
+  of SQL. `GROUP BY type` has no index to lean on in opencode's schema, and SQLite's fallback sorter
+  carries the whole `data` column: measured on a 4.4 GB database that query took ~80 s and churned
+  ~34 GB of temporary files (SQLite unlinks them immediately, but Windows only returns the space
+  when the last handle closes, so the system drive appears to be filling up while it runs). The
+  streaming version takes ~15 s, peaks at a few hundred MB and creates no temporary files.
 
 ### GUI usage
 

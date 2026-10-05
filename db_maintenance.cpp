@@ -253,34 +253,86 @@ DbReport analyze_database(const string& db_path, int top_n, const ProgressFn& pr
     if ((int)r.tables.size() > top_n) r.tables.resize((size_t)top_n);
 
     // Event log: the dominant consumer on a real database.
+    //
+    // Everything below comes from ONE sequential pass folded in C++. Doing this
+    // in SQL is a trap on this schema: `event` has two indexes and both start
+    // with aggregate_id, so `GROUP BY type` has no index to lean on and falls
+    // back to a sorter that carries the `data` column. Measured on the 4.4 GB
+    // database this module was written for, `SELECT type, COUNT(*),
+    // SUM(LENGTH(data)) FROM event GROUP BY type` takes 70-80 s and throws ~34
+    // GB of temp file at the disk (SQLite unlinks the temp files immediately,
+    // but Windows only returns the space when the last handle closes, so the
+    // drive looks like it is filling up while it runs). The streaming version
+    // takes ~15 s, needs a few MB and writes no temp files at all.
     report(progress, 55, "measuring the event log");
     r.event_rows = scalar(db.get(), "SELECT COUNT(*) FROM event");
-    r.event_bytes = scalar(db.get(), "SELECT COALESCE(SUM(LENGTH(data)),0) FROM event");
+    const long long planned_rows = r.event_rows > 0 ? r.event_rows : 1;
 
-    report(progress, 60, "grouping events by type (can take a minute)");
+    std::map<string, std::pair<long long, long long>> by_type;      // type -> rows, bytes
+    std::map<string, std::pair<long long, long long>> by_session;   // aggregate -> rows, bytes
     {
-        Stmt st(db.get(), "SELECT type, COUNT(*), COALESCE(SUM(LENGTH(data)),0) FROM event"
-                          " GROUP BY type ORDER BY 3 DESC");
+        std::set<string> live_sessions;
+        {
+            Stmt st(db.get(), "SELECT id FROM session");
+            while (sqlite3_step(st) == SQLITE_ROW) live_sessions.insert(text_at(st, 0));
+        }
+
+        report(progress, 58, "scanning the event log");
+        Stmt st(db.get(), "SELECT aggregate_id, type, COALESCE(LENGTH(data),0) FROM event");
+        long long seen = 0;
         while (sqlite3_step(st) == SQLITE_ROW) {
-            UsageEntry e;
-            e.name = text_at(st, 0);
-            e.rows = sqlite3_column_int64(st, 1);
-            e.bytes = sqlite3_column_int64(st, 2);
-            r.event_types.push_back(e);
+            const string agg = text_at(st, 0);
+            const string type = text_at(st, 1);
+            const long long bytes = sqlite3_column_int64(st, 2);
+
+            auto& t = by_type[type];
+            t.first += 1;
+            t.second += bytes;
+
+            auto& s = by_session[agg];
+            s.first += 1;
+            s.second += bytes;
+
+            if (!live_sessions.count(agg)) {
+                r.orphan_event_rows += 1;
+                r.orphan_event_bytes += bytes;
+            }
+
+            if (((++seen) & 0x3FFF) == 0)
+                report(progress, 58 + (int)(28.0 * (double)seen / (double)planned_rows),
+                       "scanning the event log " + std::to_string(seen) + " rows");
         }
     }
+
+    r.event_bytes = 0;
+    for (auto& kv : by_type) {
+        UsageEntry e;
+        e.name = kv.first;
+        e.rows = kv.second.first;
+        e.bytes = kv.second.second;
+        r.event_bytes += e.bytes;
+        r.event_types.push_back(e);
+    }
+    std::sort(r.event_types.begin(), r.event_types.end(),
+              [](const UsageEntry& a, const UsageEntry& b) { return a.bytes > b.bytes; });
     if ((int)r.event_types.size() > top_n) r.event_types.resize((size_t)top_n);
 
-    report(progress, 78, "grouping events by session");
+    report(progress, 88, "ranking sessions by event footprint");
     {
-        Stmt st(db.get(), "SELECT aggregate_id, COUNT(*), COALESCE(SUM(LENGTH(data)),0)"
-                          " FROM event GROUP BY aggregate_id ORDER BY 3 DESC LIMIT ?");
-        sqlite3_bind_int(st, 1, top_n);
-        while (sqlite3_step(st) == SQLITE_ROW) {
+        std::vector<std::pair<long long, const string*>> ranked;
+        ranked.reserve(by_session.size());
+        for (auto& kv : by_session) ranked.push_back({kv.second.second, &kv.first});
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const std::pair<long long, const string*>& a,
+                     const std::pair<long long, const string*>& b) { return a.first > b.first; });
+
+        int n = 0;
+        for (auto& item : ranked) {
+            if (n >= top_n) break;
             UsageEntry e;
-            e.name = text_at(st, 0);
-            e.rows = sqlite3_column_int64(st, 1);
-            e.bytes = sqlite3_column_int64(st, 2);
+            e.name = *item.second;
+            e.rows = by_session[*item.second].first;
+            e.bytes = item.first;
             try {
                 Stmt t(db.get(), "SELECT title FROM session WHERE id = ?");
                 sqlite3_bind_text(t, 1, e.name.c_str(), -1, SQLITE_TRANSIENT);
@@ -288,15 +340,9 @@ DbReport analyze_database(const string& db_path, int top_n, const ProgressFn& pr
             } catch (const std::exception&) {
             }
             r.sessions.push_back(e);
+            ++n;
         }
     }
-
-    report(progress, 90, "counting orphan events (from deleted sessions)");
-    r.orphan_event_rows = scalar(db.get(), "SELECT COUNT(*) FROM event e WHERE NOT EXISTS"
-                                           " (SELECT 1 FROM session s WHERE s.id = e.aggregate_id)");
-    r.orphan_event_bytes =
-        scalar(db.get(), "SELECT COALESCE(SUM(LENGTH(e.data)),0) FROM event e WHERE NOT EXISTS"
-                         " (SELECT 1 FROM session s WHERE s.id = e.aggregate_id)");
     report(progress, 94, "looking for oversized rows");
     try {
         Stmt st(db.get(), "SELECT aggregate_id, type, LENGTH(data) FROM event"

@@ -582,6 +582,21 @@ static void draw_toolbar() {
 // ---------------------------------------------------------------------------
 // UI: sessions tab
 // ---------------------------------------------------------------------------
+// Height the preview panel occupies. The sessions table subtracts this from its
+// own height so the panel cannot be pushed below the status bar.
+static float preview_panel_height() {
+    return ImGui::GetTextLineHeightWithSpacing() * 8.0f + ImGui::GetFrameHeightWithSpacing();
+}
+
+// Height a scrollable table should get when it is the only thing left in the
+// content region. Tables bottom-align ((0,0) size) otherwise, which silently
+// eats the widgets drawn after them.
+static float fill_height() {
+    float h = ImGui::GetContentRegionAvail().y;
+    const float min_h = ImGui::GetTextLineHeightWithSpacing() * 3.0f;
+    return h > min_h ? h : min_h;
+}
+
 static void draw_sessions_tab() {
     if (g_sessions.empty()) {
         ImGui::TextDisabled("No sessions found in %s", GUI_DB_PATH.c_str());
@@ -591,7 +606,11 @@ static void draw_sessions_tab() {
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
                                   ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY |
                                   ImGuiTableFlags_Sortable | ImGuiTableFlags_SizingStretchProp;
-    if (!ImGui::BeginTable("sessions", 8, flags)) return;
+    float table_h = fill_height();
+    if (g_show_preview) table_h -= preview_panel_height() + ImGui::GetStyle().ItemSpacing.y;
+    const float min_h = ImGui::GetTextLineHeightWithSpacing() * 3.0f;
+    if (table_h < min_h) table_h = min_h;
+    if (!ImGui::BeginTable("sessions", 8, flags, ImVec2(0, table_h))) return;
 
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("Sel", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
@@ -714,7 +733,7 @@ static void draw_snapshots_tab() {
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
                                   ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY |
                                   ImGuiTableFlags_Sortable | ImGuiTableFlags_SizingStretchProp;
-    if (!ImGui::BeginTable("snapshots", 6, flags)) return;
+    if (!ImGui::BeginTable("snapshots", 6, flags, ImVec2(0, fill_height()))) return;
 
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("Sel", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
@@ -811,7 +830,7 @@ static void draw_snapshots_tab() {
 static void draw_preview_panel() {
     if (!g_show_preview || g_tab != TAB_SESSIONS) return;
 
-    float h = ImGui::GetTextLineHeightWithSpacing() * 8.0f + ImGui::GetFrameHeightWithSpacing();
+    float h = preview_panel_height();
     ImGui::BeginChild("##preview", ImVec2(0, h), true);
     ImGui::TextDisabled("Preview");
     ImGui::SameLine();
@@ -1312,9 +1331,13 @@ static void handle_shortcuts() {
 static void draw_ui() {
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+    // No scrollbar on the host window: the tab content scrolls inside its own
+    // child region instead, which is what keeps the toolbar and the status bar
+    // pinned to the top and bottom edges.
     ImGui::Begin("OpenCode Session Manager", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar);
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_MenuBar);
 
     if (ImGui::BeginMenuBar()) {
         ImGui::TextUnformatted("View:");
@@ -1360,6 +1383,16 @@ static void draw_ui() {
 
     handle_shortcuts();
     ensure_view();
+
+    // Everything above the status bar lives in a height-capped child region, so
+    // the status bar is always the last line of the window. The tab content
+    // scrolls inside that region when it does not fit (the database tab does),
+    // instead of shoving the status bar around.
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float footer_h = ImGui::GetTextLineHeightWithSpacing() + style.ItemSpacing.y * 2.0f + 2.0f;
+    ImGui::BeginChild("##body", ImVec2(0, -footer_h), ImGuiChildFlags_AlwaysUseWindowPadding,
+                      ImGuiWindowFlags_None);
+
     draw_toolbar();
     ImGui::Spacing();
     ImGui::Separator();
@@ -1422,10 +1455,10 @@ static void draw_ui() {
         }
     }
 
-    // Status line
-    ImGui::Spacing();
+    ImGui::EndChild();
+
+    // Status bar: the last line of the window, whatever the tab content is.
     ImGui::Separator();
-    ImGui::Spacing();
     bool is_err = g_message.rfind("Error", 0) == 0;
     if (is_err)
         ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "%s", g_message.c_str());
@@ -1434,18 +1467,15 @@ static void draw_ui() {
 
     if (g_size_scan_pending) {
         ImGui::SameLine();
-        ImGui::TextDisabled("   scanning snapshot sizes... %d left",
-                            (int)g_size_scan_pending);
-    } else {
-        ImGui::SameLine();
-        ImGui::TextDisabled("   |   F5 refresh   Del remove   Ctrl+A all   Ctrl+D none   "
-                            "Ctrl+F search   Ctrl +/- text size");
+        ImGui::TextDisabled("   |   scanning snapshot sizes: %d left", (int)g_size_scan_pending);
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("   |   F5 refresh   Del remove   Ctrl+A all   Ctrl+D none   "
+                        "Ctrl+F search   Ctrl +/- text size");
 
     draw_confirm_modal();
     draw_error_modal();
     draw_maintenance_modal();
-
 
     ImGui::End();
     draw_toast();

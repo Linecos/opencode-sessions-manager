@@ -146,6 +146,7 @@ public:
     bool cleanup_on_exit = false;
     size_t scan_next = 0;
     size_t scan_pending = 0;
+    size_t scan_total = 0;          // how many snapshots this scan set out to measure
     string message;
     bool running = true;
 
@@ -484,7 +485,10 @@ private:
         // List only: sizes are measured progressively by pump_sizes().
         snapshots = load_snapshots(DB_PATH, SNAPSHOT_DIR, /*with_sizes=*/false);
         scan_next = 0;
-        scan_pending = snapshots.size();
+        scan_total = 0;
+        for (auto& s : snapshots)
+            if (!s.size_known) ++scan_total;
+        scan_pending = scan_total;
 
         if (!keep_view) {
             selected.clear();
@@ -958,6 +962,7 @@ private:
         if (h < 1) h = 1;
 
         draw_header(w);
+        if (h > 12) draw_scan_progress(1, w);   // row 1 is free until the list starts
 
         int list_start_y = 2;
         int list_end_y = h - 5;                 // cursor info + 2 help lines + message below
@@ -1044,6 +1049,49 @@ private:
             wattrset(stdscr, shown.empty() ? COLOR_PAIR(COLOR_DIM) : COLOR_PAIR(COLOR_FILTER));
             mvwaddswstr(stdscr, 0, x, right);
         }
+        wattrset(stdscr, A_NORMAL);
+    }
+
+    // Snapshot sizes are measured a handful of directories at a time so the UI
+    // keeps responding, which takes a while when there are many snapshots. This
+    // reports how far along that scan is, on the row between the tab bar and the
+    // list (otherwise empty).
+    void draw_scan_progress(int y, int w) {
+        if (scan_pending == 0 || scan_total == 0 || y < 1 || y >= LINES || w < 8) return;
+
+        const size_t done = scan_total > scan_pending ? scan_total - scan_pending : 0;
+        const int percent = (int)((long long)done * 100 / (long long)scan_total);
+
+        wchar_t small[80];
+        swprintf(small, 80, L" scanning sizes %3d%% (%d/%d) ", percent, (int)done,
+                 (int)scan_total);
+        const wstring label = L" Scanning snapshot sizes ";
+
+        if (w < (int)label.size() + 16) {
+            wattrset(stdscr, COLOR_PAIR(COLOR_DIM));
+            mvwaddswstr(stdscr, y, 0, truncate(small, (size_t)w));
+            wattrset(stdscr, A_NORMAL);
+            return;
+        }
+
+        wchar_t tail_buf[64];
+        swprintf(tail_buf, 64, L" %3d%%  %d/%d ", percent, (int)done, (int)scan_total);
+        const wstring tail = tail_buf;
+
+        int bar_w = w - (int)label.size() - (int)tail.size() - 2;   // 2 = the brackets
+        if (bar_w < 4) bar_w = 4;
+        int filled = (int)((long long)bar_w * (long long)done / (long long)scan_total);
+        if (filled > bar_w) filled = bar_w;
+
+        wattrset(stdscr, COLOR_PAIR(COLOR_DIM));
+        mvwaddswstr(stdscr, y, 0, label);
+        waddswstr(stdscr, L"[");
+        wattrset(stdscr, A_REVERSE | COLOR_PAIR(COLOR_SELECTED));
+        waddswstr(stdscr, wstring((size_t)filled, L' '));
+        wattrset(stdscr, COLOR_PAIR(COLOR_DIM));
+        if (bar_w > filled) waddswstr(stdscr, wstring((size_t)(bar_w - filled), L' '));
+        waddswstr(stdscr, L"]");
+        waddswstr(stdscr, tail);
         wattrset(stdscr, A_NORMAL);
     }
 
@@ -1408,6 +1456,19 @@ static bool parse_sort_field(const string& name, SortField* out) {
     return false;
 }
 
+// True when stdout is attached to a real console window. ncurses cannot
+// initialise without one, so the interactive mode checks this up front and
+// reports it instead of crashing inside the first draw.
+static bool has_console() {
+#ifdef _WIN32
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    return out != nullptr && out != INVALID_HANDLE_VALUE && GetConsoleMode(out, &mode) != 0;
+#else
+    return true;
+#endif
+}
+
 static void print_usage() {
     printf("opencode-session-manager " OPENCODE_SM_VERSION_STRING " [options]\n"
            "\n"
@@ -1757,6 +1818,17 @@ int main(int argc, char** argv) {
             fprintf(stderr, "\nError: %s\n", e.what());
             return 1;
         }
+    }
+
+    // ncurses needs an actual console. Without one (stdout redirected to a pipe,
+    // started from an IDE, run under a service...) initscr() leaves stdscr null
+    // and the first draw crashes with a heap error. Say what is wrong instead.
+    if (!has_console()) {
+        fprintf(stderr,
+                "The interactive UI needs a console window.\n"
+                "Run it from a real terminal, or use one of the headless modes:\n"
+                "  --list  --snapshots  --db-report  --preview  --export <dir>\n");
+        return 1;
     }
 
     initscr();
