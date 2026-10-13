@@ -38,8 +38,10 @@ application, written in C++17 for Windows.
 - Chinese/CJK font support (loads Microsoft YaHei etc. automatically), DPI-aware on scaled displays
   and when dragging between monitors.
 - Orphan `session_diff/*.json` cleanup, either on demand or (opt-in) on exit.
-- **Database view**: where the disk space actually goes, and the three safe ways to get it back
-  (orphan events, event-log compaction, VACUUM). On a real 4.6 GB database this found 3.9 GB.
+- **Database view**: where the disk space actually goes, and the safe ways to get it back — orphan
+  event rows, event-log compaction, VACUUM, and the files that live *next to* the database (the text
+  log, and leftover tool output a deleted session left behind). On a real 4.4 GB database this
+  reclaimed 4.5 GB.
 - Session preview (the tail of the conversation) and JSON export of selected sessions.
 - Rule based selection: `--older-than`, `--max-messages`, then "select matching" and delete.
 - A headless CLI for everything the UI does, so the tool is scriptable and testable.
@@ -244,6 +246,7 @@ Three operations, in increasing order of daring:
 | `--clean-orphan-events` | Removes event rows whose session no longer exists | Safe: the aggregate is gone, nothing can replay it |
 | `--compact-events` | Keeps only the newest version of each part | **Rewrites the event log.** Dry run by default; a backup is mandatory to apply |
 | `--vacuum` | Rewrites the file so free pages go back to the filesystem | Needs temp space ≈ the file size and a few minutes; close opencode first |
+| `--clean-aux` | Removes log files and `tool-output/` files no session references | Never touches a file a session still points at (those are part of the conversation) |
 
 ```bat
 rem see where the space goes (read-only)

@@ -119,7 +119,11 @@ static bool g_maint_modal = false;
 static bool g_maint_keep_backup = false;
 static string g_maint_backup_path;
 
-enum { MA_NONE = 0, MA_CLEAN_ORPHANS, MA_COMPACT, MA_VACUUM, MA_BACKUP };
+enum { MA_NONE = 0, MA_CLEAN_ORPHANS, MA_COMPACT, MA_VACUUM, MA_BACKUP, MA_CLEAN_AUX };
+
+// Files next to the database (log/, tool-output/), refreshed by a ScanAux job.
+static std::vector<AuxItem> g_aux;
+static bool g_aux_scan_done = false;
 
 static string timestamped_backup_path() {
     time_t now = time(nullptr);
@@ -163,6 +167,7 @@ static void start_maintenance(int action) {
     case MA_COMPACT: g_job.start(JobType::CompactEvents, GUI_DB_PATH, g_maint_backup_path); break;
     case MA_VACUUM: g_job.start(JobType::Vacuum, GUI_DB_PATH); break;
     case MA_BACKUP: g_job.start(JobType::Backup, GUI_DB_PATH, g_maint_backup_path); break;
+    case MA_CLEAN_AUX: g_job.start(JobType::CleanAux, GUI_DB_PATH); break;
     default: break;
     }
     g_job_seen = false;
@@ -1086,6 +1091,61 @@ static void draw_database_tab() {
                                 (int)st.plan.worst_parts[0].rows);
         }
     }
+
+    // Files that live next to the database rather than inside it: the text log,
+    // and the oversized tool output opencode v2 writes out as files. Deleting a
+    // session leaves those behind, so they are worth looking at -- but a file a
+    // session still points at must never be removed.
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Files next to the database");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("Scan##aux")) g_job.start(JobType::ScanAux, GUI_DB_PATH);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Log files, and oversized tool output that opencode v2 keeps outside\n"
+                          "the database. The scan works out which of them no session references.");
+
+    if (!g_aux_scan_done) {
+        ImGui::TextDisabled("Press Scan to look for removable files.");
+    } else if (g_aux.empty()) {
+        ImGui::TextDisabled("Nothing found next to the database.");
+    } else {
+        long long removable_bytes = 0;
+        int removable_count = 0;
+        for (auto& a : g_aux)
+            if (a.removable) {
+                removable_bytes += a.bytes;
+                ++removable_count;
+            }
+
+        const int kShown = 12;
+        for (int i = 0; i < (int)g_aux.size() && i < kShown; ++i) {
+            AuxItem& a = g_aux[(size_t)i];
+            if (a.removable)
+                ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "%s", a.name.c_str());
+            else
+                ImGui::Text("%s", a.name.c_str());
+            ImGui::SameLine(ImGui::GetFontSize() * 32.0f);
+            ImGui::TextDisabled("%s   %s", u8fmt_size(a.bytes).c_str(), a.note.c_str());
+        }
+        if ((int)g_aux.size() > kShown)
+            ImGui::TextDisabled("... and %d more", (int)g_aux.size() - kShown);
+
+        ImGui::Text("%d of %d file(s) removable, %s", removable_count, (int)g_aux.size(),
+                    u8fmt_size(removable_bytes).c_str());
+        ImGui::BeginDisabled(busy || removable_count == 0);
+        if (ImGui::Button("Clean removable##aux")) {
+            g_maint_action = MA_CLEAN_AUX;
+            g_maint_backup_path.clear();
+            g_maint_modal = true;
+        }
+        ImGui::EndDisabled();
+        if (removable_count == 0 && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Every file here is still referenced by a session");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,6 +1195,23 @@ static void draw_maintenance_modal() {
                                         .c_str());
             }
             break;
+        case MA_CLEAN_AUX: {
+            ImGui::Text("Remove files next to the database?");
+            ImGui::TextWrapped(
+                "The text log, and tool-output files that no session references any more -- "
+                "deleting a session leaves those behind. Files a session still points at are "
+                "never touched, because they are part of the conversation.");
+            long long aux_bytes = 0;
+            int aux_n = 0;
+            for (auto& a : g_aux)
+                if (a.removable) {
+                    aux_bytes += a.bytes;
+                    ++aux_n;
+                }
+            ImGui::Text("Would remove %d file(s), %s.", aux_n, u8fmt_size(aux_bytes).c_str());
+            ImGui::TextDisabled("A log opencode still holds open cannot be deleted - close it first.");
+            break;
+        }
         case MA_VACUUM:
             ImGui::Text("Run VACUUM?");
             ImGui::TextWrapped(
@@ -1469,6 +1546,18 @@ static void draw_ui() {
                     break;
                 case JobType::Backup:
                     g_message = "Backup written (" + u8fmt_size(st.result.bytes) + ")";
+                    break;
+                case JobType::ScanAux:
+                    g_aux = st.aux;
+                    g_aux_scan_done = true;
+                    g_message = "Scanned " + std::to_string(g_aux.size()) +
+                                " file(s) next to the database";
+                    break;
+                case JobType::CleanAux:
+                    g_aux = st.aux;
+                    g_aux_scan_done = true;
+                    g_message = "Removed " + std::to_string((int)st.result.rows) + " file(s), " +
+                                u8fmt_size(st.result.bytes);
                     break;
                 default:
                     break;

@@ -119,6 +119,7 @@ static const int kSnapshotSortCount = (int)(sizeof(kSnapshotSortFields) / sizeof
 static const string DB_PATH = db_path();
 static const string DIFF_DIR = diff_dir();
 static const string SNAPSHOT_DIR = snapshot_dir();
+static const string DATA_DIR = data_dir();
 
 // Snapshot sizes are computed a few per redraw so the UI never stalls on a large
 // data directory (the GUI does the same, a frame at a time).
@@ -1437,6 +1438,7 @@ struct CliOptions {
     bool clean_orphans = false;
     bool compact_events = false;
     bool vacuum = false;
+    bool clean_aux = false;          // log/ and unreferenced tool-output/ files
     bool preview = false;
     bool export_json = false;
     bool yes = false;                // required to actually modify anything
@@ -1494,6 +1496,8 @@ static void print_usage() {
            "  --clean-orphan-events  drop event rows of deleted sessions\n"
            "  --compact-events     keep only the newest snapshot of each part\n"
            "  --vacuum             rewrite the database file to reclaim free pages\n"
+           "  --clean-aux          remove log files and tool-output/ files no session\n"
+           "                       references (never the ones still in use)\n"
            "  --backup <path>      --compact-events: back up here before changing\n"
            "  --yes                actually perform the change (otherwise: dry run)\n"
            "\n"
@@ -1618,6 +1622,32 @@ static int run_db_report() {
             printf("  %-58s %12s\n", utf8_ellipsize(t.name, 58).c_str(),
                    wide_to_utf8(format_size(t.bytes)).c_str());
     }
+    // Files that live next to the database rather than inside it, so they never
+    // showed up in this report before. For opencode v2 this is where the
+    // oversized tool output goes, and deleting a session leaves those behind.
+    {
+        auto aux = scan_auxiliary(DATA_DIR, DB_PATH);
+        long long total_bytes = 0, freeable = 0;
+        int freeable_count = 0;
+        for (auto& a : aux) {
+            total_bytes += a.bytes;
+            if (a.removable) {
+                freeable += a.bytes;
+                ++freeable_count;
+            }
+        }
+        if (!aux.empty()) {
+            printf("\nauxiliary files (%s; %d removable, %s):\n",
+                   wide_to_utf8(format_size(total_bytes)).c_str(), freeable_count,
+                   wide_to_utf8(format_size(freeable)).c_str());
+            for (auto& a : aux)
+                printf("  %-46s %12s   %s\n", utf8_ellipsize(a.name, 46).c_str(),
+                       wide_to_utf8(format_size(a.bytes)).c_str(),
+                       a.removable ? "removable - nothing references it" : a.note.c_str());
+            printf("  -> --clean-aux removes the removable ones (dry run without --yes)\n");
+        }
+    }
+
     if (r.event_rows == 0) {
         // opencode v2 migrated the event log away; recommending a compaction
         // here would send the user after something that no longer exists.
@@ -1627,6 +1657,39 @@ static int run_db_report() {
         printf("\nhint: --compact-events reclaims much more (dry run unless you add --yes)\n");
     }
     return 0;
+}
+
+static int run_clean_aux(const CliOptions& o) {
+    auto aux = scan_auxiliary(DATA_DIR, DB_PATH, cli_progress);
+    long long bytes = 0;
+    int count = 0;
+    for (auto& a : aux) {
+        if (a.removable) {
+            bytes += a.bytes;
+            ++count;
+        }
+    }
+    if (count == 0) {
+        printf("\nNothing to clean up next to the database.\n");
+        return 0;
+    }
+
+    printf("\nremovable files (%d, %s):\n", count, wide_to_utf8(format_size(bytes)).c_str());
+    for (auto& a : aux)
+        if (a.removable)
+            printf("  %-46s %12s   %s\n", utf8_ellipsize(a.name, 46).c_str(),
+                   wide_to_utf8(format_size(a.bytes)).c_str(), a.note.c_str());
+
+    if (!o.yes) {
+        printf("\nDry run. Add --yes to remove them. Files go to the Recycle Bin unless\n"
+               "--no-recycle is set; a log opencode still holds open will fail.\n");
+        return 0;
+    }
+
+    ReclaimResult r = delete_auxiliary(aux, cli_progress);
+    printf("\nremoved %d file(s), %s%s\n", (int)r.rows, wide_to_utf8(format_size(r.bytes)).c_str(),
+           r.ok ? "" : ("   (first failure: " + r.error + ")").c_str());
+    return r.ok ? 0 : 1;
 }
 
 static int run_preview(const CliOptions& o) {
@@ -1757,6 +1820,7 @@ int main(int argc, char** argv) {
         else if (a == "--clean-orphan-events") opt.clean_orphans = true;
         else if (a == "--compact-events") opt.compact_events = true;
         else if (a == "--vacuum") opt.vacuum = true;
+        else if (a == "--clean-aux") opt.clean_aux = true;
         else if (a == "--filter") {
             const char* v = need_value("--filter");
             if (!v) return 2;
@@ -1816,13 +1880,14 @@ int main(int argc, char** argv) {
 
     // Headless modes, ordered from least to most destructive.
     if (opt.list || opt.export_json || opt.preview || opt.db_report || opt.clean_orphans ||
-        opt.compact_events || opt.vacuum) {
+        opt.compact_events || opt.vacuum || opt.clean_aux) {
         try {
             if (opt.preview) return run_preview(opt);
             if (opt.db_report) return run_db_report();
             if (opt.clean_orphans) return run_clean_orphans(opt);
             if (opt.compact_events) return run_compact(opt);
             if (opt.vacuum) return run_vacuum(opt);
+            if (opt.clean_aux) return run_clean_aux(opt);
             return run_list(opt);
         } catch (const std::exception& e) {
             fprintf(stderr, "\nError: %s\n", e.what());

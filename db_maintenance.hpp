@@ -126,6 +126,34 @@ bool backup_database(const std::string& db_path, const std::string& dest,
 bool database_is_busy(const std::string& db_path);
 
 // ---------------------------------------------------------------------------
+// Auxiliary files next to the database
+//
+// The data directory holds more than opencode.db. `log/` accumulates a text log,
+// and opencode v2 writes oversized tool output into `tool-output/` instead of
+// into the database. Those tool-output files are part of the conversation -- the
+// session records an `outputPath` pointing at them -- so only the ones no session
+// references are safe to remove. That is exactly what deleting a session leaves
+// behind, which is what makes this worth cleaning.
+//
+// The scan is read-only and cheap: the database is asked for the rows that
+// mention `tool-output`, and the referenced file names are collected from those.
+// ---------------------------------------------------------------------------
+struct AuxItem {
+    std::string name;        // relative to the data directory, e.g. "log/opencode.log"
+    std::string path;        // absolute
+    long long bytes = 0;
+    bool removable = false;  // nothing references it, or opencode recreates it
+    std::string note;        // why it is (not) removable
+};
+
+std::vector<AuxItem> scan_auxiliary(const std::string& data_dir, const std::string& db_path,
+                                    const ProgressFn& progress = nullptr);
+
+// Removes the items flagged removable (Recycle Bin when that is enabled).
+ReclaimResult delete_auxiliary(const std::vector<AuxItem>& items,
+                               const ProgressFn& progress = nullptr);
+
+// ---------------------------------------------------------------------------
 // Session preview and export
 // ---------------------------------------------------------------------------
 struct PreviewMessage {
@@ -149,7 +177,8 @@ bool export_sessions_json(const std::string& db_path,
 // ---------------------------------------------------------------------------
 // Background job wrapper (one job at a time)
 // ---------------------------------------------------------------------------
-enum class JobType { None, Report, CleanupOrphans, CompactEvents, Vacuum, Backup };
+enum class JobType { None, Report, CleanupOrphans, CompactEvents, Vacuum, Backup,
+                     ScanAux, CleanAux };
 
 const char* job_type_name(JobType type);
 
@@ -166,6 +195,7 @@ struct JobStatus {
     DbReport report;
     CompactionPlan plan;        // CompactEvents, dry run
     ReclaimResult result;
+    std::vector<AuxItem> aux;   // ScanAux / CleanAux: files next to the database
 };
 
 class MaintenanceJob {

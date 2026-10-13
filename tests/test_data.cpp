@@ -768,7 +768,21 @@ static Fixture build_v2_fixture(const string& scratch) {
     db_exec(db, "INSERT INTO instruction_state VALUES ('ses-new',1,2,'{}');");
     db_exec(db, "INSERT INTO session_inbox VALUES ('ib1','ses-new','user');");
     db_exec(db, "INSERT INTO session_pending VALUES ('pd1','ses-new','user');");
+    // A message that points at one of the tool-output files, the way opencode
+    // records where an oversized result went (JSON-escaped path, so the scanner
+    // has to cope with the doubled separators).
+    db_exec(db, "INSERT INTO session_message VALUES ('m4','ses-new','assistant',3,1000,1100,"
+                "'{\"content\":[{\"type\":\"tool\",\"outputPath\":"
+                "\"C:\\\\data\\\\tool-output\\\\tool_used\"}],\"finish\":\"stop\"}');");
     sqlite3_close(db);
+
+    // Files next to the database: one tool-output file a session points at, one
+    // nothing references (what deleting a session leaves behind), and a log.
+    make_dir(path_join(fx.root, "tool-output"));
+    make_dir(path_join(fx.root, "log"));
+    write_file(path_join(path_join(fx.root, "tool-output"), "tool_used"), "trimmed result");
+    write_file(path_join(path_join(fx.root, "tool-output"), "tool_orphan"), "stale result");
+    write_file(path_join(path_join(fx.root, "log"), "opencode.log"), "one log line\n");
 
     write_file(path_join(fx.diff, "ses-new.json"), "{}");
     write_file(path_join(fx.diff, "ses-dead.json"), "{}");
@@ -810,19 +824,21 @@ static void test_v2_schema(const string& scratch) {
         CHECK(sessions.size() == 2, "both v2 sessions are listed");
         CHECK(has_new, "a session that exists only in session_v2 is listed");
         CHECK(has_old, "the migrated session is listed");
-        CHECK(new_msgs == 2, "msg_count is read from session_message");
+        CHECK(new_msgs == 3, "msg_count is read from session_message");
     }
 
     SECTION("opencode v2: preview reads session_message");
     {
         auto msgs = load_session_preview(fx.db, "ses-new", 10);
-        CHECK(msgs.size() == 2, "both messages previewed");
-        if (msgs.size() == 2) {
+        CHECK(msgs.size() == 3, "all three messages previewed");
+        if (msgs.size() == 3) {
             CHECK(msgs[0].role == "assistant", "role comes from the message type");
             CHECK(msgs[1].role == "user", "the second message keeps its role");
             CHECK(msgs[0].text.find("第二条") != string::npos,
                   "text is pulled out of the content array");
             CHECK(msgs[0].text.find("think") == string::npos, "reasoning text is skipped");
+            CHECK(msgs[2].text.find("stop") != string::npos,
+                  "a message with no text part falls back to its finish reason");
         }
     }
 
@@ -865,6 +881,47 @@ static void test_v2_schema(const string& scratch) {
         CHECK(r.session_rows == 1, "the surviving session is counted from session_v2");
         CHECK(r.message_rows == 1, "messages are counted from session_message");
     }
+}
+
+// Files next to the database: the log, and the oversized tool output opencode v2
+// keeps out of the database. A file a session points at is part of the
+// conversation and must survive; one nothing references is what deleting a
+// session leaves behind.
+static void test_v2_auxiliary(const string& scratch) {
+    SECTION("opencode v2: files next to the database");
+    Fixture fx = build_v2_fixture(scratch);
+    const string out_dir = path_join(fx.root, "tool-output");
+    const string log_dir = path_join(fx.root, "log");
+
+    auto aux = scan_auxiliary(fx.root, fx.db);
+    bool saw_used = false, saw_orphan = false, saw_log = false;
+    for (auto& a : aux) {
+        if (a.name == "tool-output/tool_used") {
+            saw_used = true;
+            CHECK(!a.removable, "a tool-output file a session points at is kept");
+        } else if (a.name == "tool-output/tool_orphan") {
+            saw_orphan = true;
+            CHECK(a.removable, "an unreferenced tool-output file is removable");
+        } else if (a.name == "log/opencode.log") {
+            saw_log = true;
+            CHECK(a.removable, "the log is removable");
+        }
+    }
+    CHECK(saw_used && saw_orphan && saw_log, "all three files were found");
+
+    ReclaimResult r = delete_auxiliary(aux);
+    CHECK(r.ok, "cleanup reported success");
+    CHECK(r.rows == 2, "exactly the two removable files were removed");
+    CHECK(path_exists(path_join(out_dir, "tool_used")), "the referenced file survives");
+    CHECK(!path_exists(path_join(out_dir, "tool_orphan")), "the orphan is gone");
+    CHECK(!path_exists(path_join(log_dir, "opencode.log")), "the log is gone");
+
+    // A second run has nothing left to do.
+    auto again = scan_auxiliary(fx.root, fx.db);
+    int removable = 0;
+    for (auto& a : again)
+        if (a.removable) ++removable;
+    CHECK(removable == 0, "nothing removable is left behind");
 }
 
 static void test_launch_guard() {    SECTION("launch guard");
@@ -921,6 +978,7 @@ int main(int argc, char** argv) {
     test_remove_tree(fx);
     test_db_maintenance(scratch);
     test_v2_schema(scratch);
+    test_v2_auxiliary(scratch);
     test_launch_guard();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

@@ -715,6 +715,127 @@ bool database_is_busy(const string& db_path) {
 }
 
 // ===========================================================================
+// Auxiliary files next to the database (log/, tool-output/)
+// ===========================================================================
+namespace {
+
+// An oversized tool result is stored as a file under `tool-output/` and the
+// conversation records where it went -- either as
+// `"outputPath":"...\\tool-output\\tool_xxx"` or inline as
+// "Full output saved to: ...\\tool-output\\tool_xxx". Collecting those names is
+// what lets the live files be told apart from the ones a deleted session left
+// behind; removing a referenced file would tear a hole in the history.
+void collect_tool_output_refs(const string& text, std::set<string>* out) {
+    const string marker = "tool-output";
+    size_t pos = 0;
+    while ((pos = text.find(marker, pos)) != string::npos) {
+        size_t i = pos + marker.size();
+        // The path may be JSON-escaped, so allow a run of separators -- but
+        // require at least one, otherwise this is just prose.
+        size_t seps = 0;
+        while (i < text.size() && (text[i] == '\\' || text[i] == '/')) {
+            ++i;
+            ++seps;
+        }
+        if (seps == 0) {
+            pos = i;
+            continue;
+        }
+        size_t start = i;
+        while (i < text.size() && (isalnum((unsigned char)text[i]) || text[i] == '_' ||
+                                   text[i] == '-' || text[i] == '.'))
+            ++i;
+        if (i > start) out->insert(text.substr(start, i - start));
+        pos = i;
+    }
+}
+
+string base_name(const string& path) {
+    size_t p = path.find_last_of("\\/");
+    return p == string::npos ? path : path.substr(p + 1);
+}
+
+// The data directory is simply where opencode.db lives.
+string data_dir_of(const string& db_path) {
+    size_t p = db_path.find_last_of("\\/");
+    return p == string::npos ? string(".") : db_path.substr(0, p);
+}
+
+}  // namespace
+
+vector<AuxItem> scan_auxiliary(const string& data_dir, const string& db_path,
+                               const ProgressFn& progress) {
+    vector<AuxItem> out;
+
+    report(progress, 10, "collecting tool-output references");
+    std::set<string> referenced;
+    {
+        Db db(db_path, SQLITE_OPEN_READONLY);
+        for (const char* table : {"session_message", "message", "part"}) {
+            if (!has_table(db.get(), table)) continue;
+            Stmt st(db.get(), string("SELECT data FROM \"") + table +
+                                  "\" WHERE data LIKE '%tool-output%'");
+            while (sqlite3_step(st) == SQLITE_ROW)
+                collect_tool_output_refs(text_at(st, 0), &referenced);
+        }
+    }
+
+    report(progress, 60, "listing auxiliary files");
+
+    for (auto& f : list_child_files(path_join(data_dir, "log"))) {
+        AuxItem it;
+        it.path = f;
+        it.name = "log/" + base_name(f);
+        it.bytes = file_size(f);
+        it.removable = true;
+        it.note = "text log - opencode starts a new one (close opencode first)";
+        out.push_back(it);
+    }
+
+    for (auto& f : list_child_files(path_join(data_dir, "tool-output"))) {
+        AuxItem it;
+        it.path = f;
+        const string base = base_name(f);
+        it.name = "tool-output/" + base;
+        it.bytes = file_size(f);
+        it.removable = referenced.find(base) == referenced.end();
+        it.note = it.removable ? "no session references it"
+                               : "a session still references it";
+        out.push_back(it);
+    }
+
+    std::sort(out.begin(), out.end(), [](const AuxItem& a, const AuxItem& b) {
+        if (a.removable != b.removable) return a.removable;   // actionable first
+        return a.bytes > b.bytes;
+    });
+    report(progress, 100, "auxiliary scan complete");
+    return out;
+}
+
+ReclaimResult delete_auxiliary(const vector<AuxItem>& items, const ProgressFn& progress) {
+    ReclaimResult out;
+    size_t done = 0;
+    for (auto& it : items) {
+        if (!it.removable) continue;
+        report(progress, (int)(100.0 * (double)done / (double)std::max<size_t>(1, items.size())),
+               "removing " + it.name);
+        try {
+            delete_file(it.path);
+            out.rows += 1;
+            out.bytes += it.bytes;
+        } catch (const std::exception& e) {
+            // A log opencode still holds open cannot be deleted; keep going and
+            // surface the first failure.
+            if (out.error.empty()) out.error = it.name + ": " + e.what();
+        }
+        ++done;
+    }
+    out.ok = out.error.empty();
+    report(progress, 100, "auxiliary cleanup complete");
+    return out;
+}
+
+// ===========================================================================
 // Session preview and export
 // ===========================================================================
 namespace {
@@ -913,6 +1034,8 @@ const char* job_type_name(JobType type) {
     case JobType::CompactEvents: return "compact event log";
     case JobType::Vacuum: return "VACUUM";
     case JobType::Backup: return "backup database";
+    case JobType::ScanAux: return "scan files next to the database";
+    case JobType::CleanAux: return "clean files next to the database";
     default: return "idle";
     }
 }
@@ -999,6 +1122,16 @@ bool MaintenanceJob::start(JobType type, const string& db_path, const string& ar
                 result.result.file_after = copied;
                 break;
             }
+            case JobType::ScanAux:
+                result.aux = scan_auxiliary(data_dir_of(db_path), db_path, progress);
+                break;
+            case JobType::CleanAux:
+                // Rescan rather than trusting an earlier list: between the
+                // confirmation dialog and this call a session may have been
+                // deleted, which is exactly what turns a file into an orphan.
+                result.aux = scan_auxiliary(data_dir_of(db_path), db_path, progress);
+                result.result = delete_auxiliary(result.aux, progress);
+                break;
             default:
                 break;
             }
@@ -1013,6 +1146,7 @@ bool MaintenanceJob::start(JobType type, const string& db_path, const string& ar
         im->st.report = result.report;
         im->st.plan = result.plan;
         im->st.result = result.result;
+        im->st.aux = result.aux;
         im->st.ok = ok;
         im->st.error = result.error.empty() ? result.result.error : result.error;
         im->st.percent = 100;
