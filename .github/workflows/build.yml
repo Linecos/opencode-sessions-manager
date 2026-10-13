@@ -13,28 +13,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # UCRT64 rather than MINGW64: the MINGW64 subsystem is deprecated upstream
+      # and warns on every run. The installation directory is NOT fixed (the
+      # action decides, and it is not necessarily C:\msys64), so it is read back
+      # from the action output instead of being assumed.
       - name: Install MinGW-w64 toolchain
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: false
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-sqlite3
-            mingw-w64-x86_64-ncurses
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-ncurses
           path-type: inherit
+
+      # One cheap step that fails loudly with the real paths, so a toolchain
+      # that moved cannot be mistaken for a broken build script.
+      - name: Show toolchain
+        shell: cmd
+        env:
+          MINGW_ROOT: ${{ steps.msys2.outputs.msys2-location }}\ucrt64
+        run: |
+          echo MSYS2 root:    ${{ steps.msys2.outputs.msys2-location }}
+          echo toolchain:     %MINGW_ROOT%
+          if not exist "%MINGW_ROOT%\bin\g++.exe" (
+            echo g++.exe is not where the build expects it. bin\ contains:
+            dir "%MINGW_ROOT%\bin"
+            exit /b 1
+          )
+          "%MINGW_ROOT%\bin\g++.exe" --version
 
       # The build scripts take the toolchain location from MINGW_ROOT/MINGW_OPT,
       # so the same scripts build against MSYS2 here and against C:\MinGW
-      # locally. OPENCODE_NO_STATIC=1 drops -static: the runner has the shared
-      # ncurses/sqlite3 libraries, and the release build keeps static linking.
+      # locally. OPENCODE_NO_STATIC=1 drops -static: the runner links against the
+      # shared ncurses/sqlite3, and the release build keeps static linking.
+      #
+      # ucrt64\bin goes on PATH because build_tests.bat RUNS the test binary,
+      # which then needs libsqlite3-0.dll and friends.
       - name: Build TUI, GUI and tests
         shell: cmd
         env:
-          MINGW_ROOT: C:\msys64\mingw64
-          MINGW_OPT: C:\msys64\mingw64
+          MINGW_ROOT: ${{ steps.msys2.outputs.msys2-location }}\ucrt64
+          MINGW_OPT: ${{ steps.msys2.outputs.msys2-location }}\ucrt64
           OPENCODE_NO_STATIC: "1"
         run: |
+          set PATH=%MINGW_ROOT%\bin;%PATH%
           build.bat
           if errorlevel 1 exit /b 1
           build_gui.bat

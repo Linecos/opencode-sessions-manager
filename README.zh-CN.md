@@ -1,7 +1,7 @@
 # OpenCode Session Manager
 
-[![Release](https://img.shields.io/github/v/release/Linecos/opencode-session-manager?sort=semver&color=2ea44f)](https://github.com/Linecos/opencode-session-manager/releases/latest)
-[![Build](https://github.com/Linecos/opencode-session-manager/actions/workflows/build.yml/badge.svg)](https://github.com/Linecos/opencode-session-manager/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/Linecos/opencode-sessions-manager?sort=semver&color=2ea44f)](https://github.com/Linecos/opencode-sessions-manager/releases/latest)
+[![Build](https://github.com/Linecos/opencode-sessions-manager/actions/workflows/build.yml/badge.svg)](https://github.com/Linecos/opencode-sessions-manager/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D6.svg)](#环境要求)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](#环境要求)
