@@ -1,5 +1,6 @@
 // Database maintenance implementation. See db_maintenance.hpp for the why.
 #include "db_maintenance.hpp"
+#include "opencode_data.hpp"   // session_table() / message_table() (v1 vs v2)
 
 #include <sqlite3.h>
 
@@ -72,6 +73,12 @@ long long scalar(sqlite3* db, const string& sql) {
     return sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int64(st, 0) : 0;
 }
 
+bool has_table(sqlite3* db, const char* name) {
+    Stmt st(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?");
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+    return sqlite3_step(st) == SQLITE_ROW;
+}
+
 void report(const ProgressFn& p, int percent, const string& stage) {
     if (p) p(percent, stage);
 }
@@ -119,15 +126,11 @@ bool has_dbstat(sqlite3* db) {
 // Anything that does not look exactly as expected reports false, and callers
 // treat that as "do not touch this row".
 // ---------------------------------------------------------------------------
-bool json_find_string(const string& json, const string& key, string* out) {
-    string needle = "\"" + key + "\":\"";
-    size_t pos = json.find(needle);
-    if (pos == string::npos) {
-        needle = "\"" + key + "\": \"";
-        pos = json.find(needle);
-        if (pos == string::npos) return false;
-    }
-    size_t i = pos + needle.size();
+// Reads the string literal whose opening quote was already consumed: `i` points
+// just past it. Returns the position after the closing quote, or npos when the
+// value is truncated. Shared by json_find_string() and by the v2 message scan
+// below, which has to walk several strings inside one payload.
+size_t json_string_at(const string& json, size_t i, string* out) {
     string value;
     while (i < json.size()) {
         char c = json[i];
@@ -170,13 +173,24 @@ bool json_find_string(const string& json, const string& key, string* out) {
             continue;
         }
         if (c == '"') {
-            *out = value;
-            return true;
+            if (out) *out = value;
+            return i + 1;
         }
         value += c;
         ++i;
     }
-    return false;
+    return string::npos;
+}
+
+bool json_find_string(const string& json, const string& key, string* out) {
+    string needle = "\"" + key + "\":\"";
+    size_t pos = json.find(needle);
+    if (pos == string::npos) {
+        needle = "\"" + key + "\": \"";
+        pos = json.find(needle);
+        if (pos == string::npos) return false;
+    }
+    return json_string_at(json, pos + needle.size(), out) != string::npos;
 }
 
 // Reading a 512 byte head of a multi-hundred-MB cell would make sqlite
@@ -201,15 +215,19 @@ DbReport analyze_database(const string& db_path, int top_n, const ProgressFn& pr
     r.free_bytes = r.page_size * r.freelist_count;
 
     report(progress, 4, "counting rows");
-    r.session_rows = scalar(db.get(), "SELECT COUNT(*) FROM session");
-    r.message_rows = scalar(db.get(), "SELECT COUNT(*) FROM message");
-    r.part_rows = scalar(db.get(), "SELECT COUNT(*) FROM part");
+    // opencode v2 renamed these (see opencode_data.hpp): sessions live in
+    // `session_v2` and whole messages in `session_message`. `part` only exists in
+    // v1 databases, where it holds the individual message parts.
+    r.session_rows = scalar(db.get(), "SELECT COUNT(*) FROM \"" + session_table(db.get()) + "\"");
+    r.message_rows = scalar(db.get(), "SELECT COUNT(*) FROM \"" + message_table(db.get()) + "\"");
+    r.part_rows = has_table(db.get(), "part") ? scalar(db.get(), "SELECT COUNT(*) FROM part") : 0;
 
     // Per-table footprint. dbstat gives exact page usage but needs
     // SQLITE_ENABLE_DBSTAT_VTAB -- the MinGW sqlite3 3.23 in use here does not
     // have it, so fall back to summing the text columns. That is an estimate,
     // which is plenty to answer "which table eats the disk".
     r.dbstat_available = has_dbstat(db.get());
+    r.v2_schema = has_table(db.get(), "session_v2");
     if (r.dbstat_available) {
         report(progress, 10, "scanning table pages (dbstat)");
         Stmt st(db.get(), "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC");
@@ -273,7 +291,7 @@ DbReport analyze_database(const string& db_path, int top_n, const ProgressFn& pr
     {
         std::set<string> live_sessions;
         {
-            Stmt st(db.get(), "SELECT id FROM session");
+            Stmt st(db.get(), "SELECT id FROM \"" + session_table(db.get()) + "\"");
             while (sqlite3_step(st) == SQLITE_ROW) live_sessions.insert(text_at(st, 0));
         }
 
@@ -334,7 +352,8 @@ DbReport analyze_database(const string& db_path, int top_n, const ProgressFn& pr
             e.rows = by_session[*item.second].first;
             e.bytes = item.first;
             try {
-                Stmt t(db.get(), "SELECT title FROM session WHERE id = ?");
+                Stmt t(db.get(), "SELECT title FROM \"" + session_table(db.get()) +
+                                         "\" WHERE id = ?");
                 sqlite3_bind_text(t, 1, e.name.c_str(), -1, SQLITE_TRANSIENT);
                 if (sqlite3_step(t) == SQLITE_ROW) e.extra = utf8_ellipsize(text_at(t, 0), 40);
             } catch (const std::exception&) {
@@ -380,7 +399,7 @@ ReclaimResult delete_orphan_events(const string& db_path, const ProgressFn& prog
     report(progress, 2, "listing surviving sessions");
     std::set<string> live;
     {
-        Stmt st(db.get(), "SELECT id FROM session");
+        Stmt st(db.get(), "SELECT id FROM \"" + session_table(db.get()) + "\"");
         while (sqlite3_step(st) == SQLITE_ROW) live.insert(text_at(st, 0));
     }
 
@@ -698,40 +717,99 @@ bool database_is_busy(const string& db_path) {
 // ===========================================================================
 // Session preview and export
 // ===========================================================================
+namespace {
+
+// opencode v2 keeps one row per message in `session_message`; the readable text
+// lives in the `content` array, whose entries have the same {"type","text"}
+// shape as v1 parts. Pull every `"type":"text"` entry's string out, in order.
+string v2_message_text(const string& data) {
+    string out;
+    size_t pos = 0;
+    while (out.size() < 1500) {
+        size_t marker = data.find("\"type\":\"text\"", pos);
+        if (marker == string::npos) marker = data.find("\"type\": \"text\"", pos);
+        if (marker == string::npos) break;
+        size_t k = data.find("\"text\":", marker);
+        if (k == string::npos) break;
+        k += 7;
+        while (k < data.size() && data[k] == ' ') ++k;
+        if (k >= data.size() || data[k] != '"') {
+            pos = marker + 1;
+            continue;
+        }
+        string s;
+        size_t end = json_string_at(data, k + 1, &s);
+        if (end == string::npos) break;
+        if (!out.empty()) out += '\n';
+        out += s;
+        pos = end;
+    }
+    return out;
+}
+
+}  // namespace
+
 vector<PreviewMessage> load_session_preview(const string& db_path, const string& session_id,
                                             int limit) {
     Db db(db_path);
-    // Newest parts first, then flipped, so "limit" means "the last N".
-    Stmt st(db.get(),
-            "SELECT p.data, p.time_created, m.data FROM part p"
-            " LEFT JOIN message m ON m.id = p.message_id"
-            " WHERE p.session_id = ?"
-            " ORDER BY p.time_created DESC, p.id DESC LIMIT ?");
-    sqlite3_bind_text(st, 1, session_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(st, 2, limit);
+    // opencode v2 keeps whole messages in `session_message` (type is
+    // user/assistant/system); v1 kept individual parts in `part` with the role
+    // on the parent message's JSON.
+    const bool v2 = has_table(db.get(), "session_message");
 
+    // Newest first, then flipped below, so "limit" means "the last N".
     vector<PreviewMessage> reversed;
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        PreviewMessage m;
-        m.time_created = sqlite3_column_int64(st, 1);
-        string data = text_at(st, 0);
-        string role;
-        if (json_find_string(text_at(st, 2), "role", &role)) m.role = role;
-        string type;
-        json_find_string(data, "type", &type);
-        m.kind = type.empty() ? "part" : type;
-        if (type == "text") {
-            string text;
-            if (json_find_string(data, "text", &text)) m.text = utf8_ellipsize(text, 300);
-        } else if (type == "tool") {
-            string tool;
-            json_find_string(data, "tool", &tool);
-            m.text = tool.empty() ? "[tool]" : ("[tool] " + tool);
-        } else if (!type.empty()) {
-            m.text = "[" + type + "]";
+
+    if (v2) {
+        Stmt st(db.get(), "SELECT type, time_created, data FROM session_message"
+                          " WHERE session_id = ? ORDER BY seq DESC LIMIT ?");
+        sqlite3_bind_text(st, 1, session_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, limit);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            PreviewMessage m;
+            m.role = text_at(st, 0);
+            m.time_created = sqlite3_column_int64(st, 1);
+            string data = text_at(st, 2);
+            m.kind = m.role.empty() ? "message" : m.role;
+            m.text = utf8_ellipsize(v2_message_text(data), 300);
+            if (m.text.empty()) {
+                // Reasoning-only or tool-only turn: say why there is no text.
+                string finish;
+                json_find_string(data, "finish", &finish);
+                m.text = finish.empty() ? "(no text)" : ("[" + finish + "]");
+            }
+            reversed.push_back(m);
         }
-        if (m.text.empty()) m.text = "(no text)";
-        reversed.push_back(m);
+    } else {
+        Stmt st(db.get(),
+                "SELECT p.data, p.time_created, m.data FROM part p"
+                " LEFT JOIN message m ON m.id = p.message_id"
+                " WHERE p.session_id = ?"
+                " ORDER BY p.time_created DESC, p.id DESC LIMIT ?");
+        sqlite3_bind_text(st, 1, session_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, limit);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            PreviewMessage m;
+            m.time_created = sqlite3_column_int64(st, 1);
+            string data = text_at(st, 0);
+            string role;
+            if (json_find_string(text_at(st, 2), "role", &role)) m.role = role;
+            string type;
+            json_find_string(data, "type", &type);
+            m.kind = type.empty() ? "part" : type;
+            if (type == "text") {
+                string text;
+                if (json_find_string(data, "text", &text)) m.text = utf8_ellipsize(text, 300);
+            } else if (type == "tool") {
+                string tool;
+                json_find_string(data, "tool", &tool);
+                m.text = tool.empty() ? "[tool]" : ("[tool] " + tool);
+            } else if (!type.empty()) {
+                m.text = "[" + type + "]";
+            }
+            if (m.text.empty()) m.text = "(no text)";
+            reversed.push_back(m);
+        }
     }
     std::reverse(reversed.begin(), reversed.end());
     return reversed;

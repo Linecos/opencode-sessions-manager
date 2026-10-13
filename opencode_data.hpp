@@ -113,6 +113,16 @@ struct Snapshot {
 sqlite3* open_db(const string& path);
 string col_text(sqlite3_stmt* st, int i);
 
+// opencode v2 renamed `session` to `session_v2` (the migration copies the old
+// rows across and leaves the v1 table frozen) and moved the message store from
+// `message` + `part` into `session_message`.  These resolve the right table for
+// the database at hand: the v2 name when it exists, the v1 name otherwise.
+// Reading `session` on a v2 database silently hides every session created after
+// the upgrade -- and makes cleanup_orphan_diffs treat those sessions' diff files
+// as orphans, which is data loss.
+string session_table(sqlite3* db);
+string message_table(sqlite3* db);
+
 std::vector<Session> load_sessions(const string& path);
 
 // with_sizes == false leaves Snapshot::size at 0 and size_known at false, so a

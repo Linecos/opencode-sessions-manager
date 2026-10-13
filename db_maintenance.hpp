@@ -36,6 +36,10 @@ struct DbReport {
     long long freelist_count = 0;
 
     bool dbstat_available = false;
+    // opencode v2 layout: sessions in `session_v2`, whole messages in
+    // `session_message`, and the append-only `event` log retired. The v1 tables
+    // (session/message/part) survive as frozen leftovers after the migration.
+    bool v2_schema = false;
 
     // What a session/snapshot based cleanup can actually reach, for contrast
     // with event_bytes -- the numbers that made this module necessary.

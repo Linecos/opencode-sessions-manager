@@ -17,6 +17,12 @@ application, written in C++17 for Windows.
 ## Features
 
 - Browse all OpenCode sessions, snapshot directories and their sizes.
+- **Works with both opencode database layouts.** v1 keeps sessions in `session` and messages in
+  `message` + `part`, with an append-only `event` log; v2 moved them to `session_v2` and
+  `session_message` and retired the event log. The tool resolves the right tables per database, so
+  nothing created after an upgrade goes missing (and a v2 session's `session_diff` is never mistaken
+  for an orphan). When the event log is gone the database view says so instead of offering a
+  compaction that has nothing to act on.
 - **Both front ends share the same feature set** and the same filter/sort code
   (`session_view.cpp`), so they cannot drift apart.
 - **Sessions** view: id, title, project / worktree, message count, created & updated.

@@ -701,6 +701,172 @@ static void test_db_maintenance(const string& scratch) {
           "export: an empty destination directory is refused");
 }
 
+// ---------------------------------------------------------------------------
+// opencode v2 layout. The migration moved sessions into `session_v2` and the
+// message store into `session_message`, retired the append-only `event` log, and
+// left the v1 tables (session/message/part) behind, frozen. Reading `session`
+// here would hide everything created after the upgrade -- and would make
+// cleanup_orphan_diffs treat those sessions' diff files as orphans.
+// ---------------------------------------------------------------------------
+static const char* SCHEMA_V2 =
+    "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);"
+    // frozen v1 leftovers
+    "CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, title TEXT,"
+    "        time_created INTEGER, time_updated INTEGER);"
+    "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);"
+    "CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, data TEXT);"
+    // the v2 tables: no foreign keys declared, only session_id columns
+    "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT,"
+    "        time_created INTEGER, time_updated INTEGER, version TEXT);"
+    "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT,"
+    "        seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);"
+    "CREATE TABLE instruction_state (session_id TEXT, epoch_start INTEGER,"
+    "        through_seq INTEGER, current_values TEXT);"
+    "CREATE TABLE session_inbox (id TEXT PRIMARY KEY, session_id TEXT, type TEXT);"
+    "CREATE TABLE session_pending (id TEXT PRIMARY KEY, session_id TEXT, type TEXT);"
+    // retired, but the table (and its free pages) are still there
+    "CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, seq INTEGER,"
+    "        type TEXT, data TEXT);";
+
+static Fixture build_v2_fixture(const string& scratch) {
+    Fixture fx;
+    fx.root = path_join(scratch, "v2 数据目录");
+    fx.db = path_join(fx.root, "opencode.db");
+    fx.snapshot = path_join(path_join(fx.root, "storage"), "快照目录");
+    fx.diff = path_join(path_join(fx.root, "storage"), "session_diff");
+
+    set_delete_to_recycle(false);
+    if (path_exists(fx.root)) remove_tree(fx.root);
+    make_dir(scratch);
+    make_dir(fx.root);
+    make_dir(path_join(fx.root, "storage"));
+    make_dir(fx.snapshot);
+    make_dir(fx.diff);
+
+    sqlite3* db = nullptr;
+    db_open(fx.db, &db);
+    if (!db) return fx;
+    db_exec(db, SCHEMA_V2);
+
+    db_exec(db, "INSERT INTO project VALUES ('p1','E:/code/新项目','新项目');");
+    // a v1-era session the migration copied across, and a v2-only one
+    db_exec(db, "INSERT INTO session VALUES ('ses-old','p1','旧会话',1000,2000);");
+    db_exec(db, "INSERT INTO session_v2 VALUES ('ses-old','p1','旧会话',1000,2000,'1.18.34');");
+    db_exec(db, "INSERT INTO session_v2 VALUES ('ses-new','p1','新会话',3000,4000,'2.0.25');");
+
+    auto add_msg = [&](const string& id, const string& sid, const string& type, long long seq,
+                       const string& text) {
+        db_exec(db, "INSERT INTO session_message VALUES ('" + id + "','" + sid + "','" + type +
+                        "'," + std::to_string(seq) + ",1000,1100,"
+                        "'{\"content\":[{\"type\":\"reasoning\",\"text\":\"think\"},"
+                        "{\"type\":\"text\",\"text\":\"" + text + "\"}],\"finish\":\"stop\"}');");
+    };
+    add_msg("m1", "ses-old", "user", 1, "hello v2");
+    add_msg("m2", "ses-new", "assistant", 1, "第二条");
+    add_msg("m3", "ses-new", "user", 2, "第二条 again");
+
+    db_exec(db, "INSERT INTO instruction_state VALUES ('ses-new',1,2,'{}');");
+    db_exec(db, "INSERT INTO session_inbox VALUES ('ib1','ses-new','user');");
+    db_exec(db, "INSERT INTO session_pending VALUES ('pd1','ses-new','user');");
+    sqlite3_close(db);
+
+    write_file(path_join(fx.diff, "ses-new.json"), "{}");
+    write_file(path_join(fx.diff, "ses-dead.json"), "{}");
+    return fx;
+}
+
+static void test_v2_schema(const string& scratch) {
+    SECTION("opencode v2: table resolution");
+    Fixture fx = build_v2_fixture(scratch);
+    {
+        sqlite3* db = nullptr;
+        db_open(fx.db, &db);
+        CHECK(session_table(db) == "session_v2", "session_table picks session_v2");
+        CHECK(message_table(db) == "session_message", "message_table picks session_message");
+        sqlite3_close(db);
+    }
+    {
+        // a v1 database (no session_v2) must still resolve to the old names
+        string v1_path = path_join(scratch, "v1-only.db");
+        if (path_exists(v1_path)) delete_file(v1_path);
+        sqlite3* db = nullptr;
+        db_open(v1_path, &db);
+        db_exec(db, "CREATE TABLE session (id TEXT PRIMARY KEY);"
+                    "CREATE TABLE message (id TEXT PRIMARY KEY);");
+        CHECK(session_table(db) == "session", "v1 database falls back to session");
+        CHECK(message_table(db) == "message", "v1 database falls back to message");
+        sqlite3_close(db);
+    }
+
+    SECTION("opencode v2: sessions come from session_v2");
+    {
+        auto sessions = load_sessions(fx.db);
+        bool has_new = false, has_old = false;
+        long long new_msgs = -1;
+        for (auto& s : sessions) {
+            if (s.id == "ses-new") { has_new = true; new_msgs = s.msg_count; }
+            if (s.id == "ses-old") has_old = true;
+        }
+        CHECK(sessions.size() == 2, "both v2 sessions are listed");
+        CHECK(has_new, "a session that exists only in session_v2 is listed");
+        CHECK(has_old, "the migrated session is listed");
+        CHECK(new_msgs == 2, "msg_count is read from session_message");
+    }
+
+    SECTION("opencode v2: preview reads session_message");
+    {
+        auto msgs = load_session_preview(fx.db, "ses-new", 10);
+        CHECK(msgs.size() == 2, "both messages previewed");
+        if (msgs.size() == 2) {
+            CHECK(msgs[0].role == "assistant", "role comes from the message type");
+            CHECK(msgs[1].role == "user", "the second message keeps its role");
+            CHECK(msgs[0].text.find("第二条") != string::npos,
+                  "text is pulled out of the content array");
+            CHECK(msgs[0].text.find("think") == string::npos, "reasoning text is skipped");
+        }
+    }
+
+    SECTION("opencode v2: orphan diff cleanup must not eat live sessions");
+    {
+        std::vector<string> failed;
+        auto removed = cleanup_orphan_diffs(fx.db, fx.diff, &failed);
+        CHECK(path_exists(path_join(fx.diff, "ses-new.json")),
+              "the diff of a v2-only session survives");
+        CHECK(!path_exists(path_join(fx.diff, "ses-dead.json")), "the real orphan is removed");
+        CHECK(removed.size() == 1, "exactly one orphan removed");
+    }
+
+    SECTION("opencode v2: deleting cascades through the v2 tables");
+    {
+        int n = delete_sessions(fx.db, {"ses-new"});
+        CHECK(n == 1, "one session row deleted");
+        sqlite3* db = nullptr;
+        db_open(fx.db, &db);
+        CHECK(db_scalar(db, "SELECT COUNT(*) FROM session_v2 WHERE id='ses-new'") == 0,
+              "the session_v2 row is gone");
+        CHECK(db_scalar(db, "SELECT COUNT(*) FROM session_message WHERE session_id='ses-new'") == 0,
+              "session_message rows are gone");
+        CHECK(db_scalar(db, "SELECT COUNT(*) FROM instruction_state WHERE session_id='ses-new'") == 0,
+              "instruction_state rows are gone");
+        CHECK(db_scalar(db, "SELECT COUNT(*) FROM session_inbox WHERE session_id='ses-new'") == 0,
+              "session_inbox rows are gone");
+        CHECK(db_scalar(db, "SELECT COUNT(*) FROM session_pending WHERE session_id='ses-new'") == 0,
+              "session_pending rows are gone");
+        CHECK(db_scalar(db, "SELECT COUNT(*) FROM session_message WHERE session_id='ses-old'") == 1,
+              "the other session's messages survive");
+        sqlite3_close(db);
+    }
+
+    SECTION("opencode v2: a retired event log is reported as such");
+    {
+        DbReport r = analyze_database(fx.db, 8);
+        CHECK(r.v2_schema, "the v2 layout is detected");
+        CHECK(r.event_rows == 0, "the retired event log reports zero rows");
+        CHECK(r.session_rows == 1, "the surviving session is counted from session_v2");
+        CHECK(r.message_rows == 1, "messages are counted from session_message");
+    }
+}
+
 static void test_launch_guard() {    SECTION("launch guard");
 
     string err;
@@ -754,6 +920,7 @@ int main(int argc, char** argv) {
     test_locked_database(fx);
     test_remove_tree(fx);
     test_db_maintenance(scratch);
+    test_v2_schema(scratch);
     test_launch_guard();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

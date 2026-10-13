@@ -837,7 +837,7 @@ static void draw_preview_panel() {
     if (g_preview_for.empty())
         ImGui::TextDisabled("- select exactly one session");
     else
-        ImGui::TextDisabled("%s   (%d part(s) shown)", g_preview_for.c_str(), (int)g_preview.size());
+        ImGui::TextDisabled("%s   (%d item(s) shown)", g_preview_for.c_str(), (int)g_preview.size());
 
     if (!g_preview_error.empty()) {
         ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "%s", g_preview_error.c_str());
@@ -901,6 +901,10 @@ static void draw_job_progress() {
 static void draw_database_tab() {
     JobStatus st = g_job.status();
     const bool busy = st.running;
+    // opencode v2 migrated the event log away (the rows are gone, only the free
+    // pages remain). The three event buttons have nothing to act on then, so
+    // they are disabled with a reason instead of silently doing nothing.
+    const bool no_events = st.report.file_bytes > 0 && st.report.event_rows == 0;
 
     ImGui::BeginDisabled(busy);
     if (ImGui::Button("Scan database")) g_job.start(JobType::Report, GUI_DB_PATH);
@@ -910,30 +914,42 @@ static void draw_database_tab() {
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
+    ImGui::BeginDisabled(no_events);
     if (ImGui::Button("Analyse event log")) g_job.start(JobType::CompactEvents, GUI_DB_PATH);
+    ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Dry run: how much would keeping only the newest\nversion of each part reclaim?");
+        ImGui::SetTooltip(no_events
+                              ? "No event log in this database (opencode v2 migrated it away)"
+                              : "Dry run: how much would keeping only the newest\nversion of each part reclaim?");
 
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
+    ImGui::BeginDisabled(no_events);
     if (ImGui::Button("Clean orphan events")) {
         g_maint_action = MA_CLEAN_ORPHANS;
         g_maint_backup_path.clear();
         g_maint_modal = true;
     }
+    ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Remove event rows belonging to sessions that are already deleted.\nSafe: nothing can replay a deleted aggregate.");
+        ImGui::SetTooltip(no_events
+                              ? "No event log in this database (opencode v2 migrated it away)"
+                              : "Remove event rows belonging to sessions that are already deleted.\nSafe: nothing can replay a deleted aggregate.");
 
     ImGui::SameLine();
+    ImGui::BeginDisabled(no_events);
     if (ImGui::Button("Compact event log")) {
         g_maint_action = MA_COMPACT;
         g_maint_keep_backup = true;
         g_maint_backup_path = timestamped_backup_path();
         g_maint_modal = true;
     }
+    ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Keep only the newest snapshot of each message part.\nThis rewrites the opencode event log - back up first.");
+        ImGui::SetTooltip(no_events
+                              ? "No event log in this database (opencode v2 migrated it away)"
+                              : "Keep only the newest snapshot of each message part.\nThis rewrites the opencode event log - back up first.");
 
     ImGui::SameLine();
     if (ImGui::Button("VACUUM")) {
@@ -951,6 +967,12 @@ static void draw_database_tab() {
         g_maint_modal = true;
     }
     ImGui::EndDisabled();
+
+    if (no_events && !busy) {
+        ImGui::Spacing();
+        ImGui::TextDisabled("No event log in this database: opencode v2 migrated it away. What it "
+                            "left behind is file space, not rows - VACUUM hands it back.");
+    }
 
     if (busy) {
         ImGui::Spacing();

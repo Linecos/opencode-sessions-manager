@@ -595,16 +595,39 @@ string col_text(sqlite3_stmt* st, int i) {
     return t ? reinterpret_cast<const char*>(t) : "";
 }
 
+namespace {
+
+bool table_present(sqlite3* db, const char* name) {
+    StmtGuard st = prepare(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?");
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+    return sqlite3_step(st) == SQLITE_ROW;
+}
+
+}  // namespace
+
+string session_table(sqlite3* db) {
+    return table_present(db, "session_v2") ? "session_v2" : "session";
+}
+
+string message_table(sqlite3* db) {
+    return table_present(db, "session_message") ? "session_message" : "message";
+}
+
 std::vector<Session> load_sessions(const string& path) {
     std::vector<Session> out;
     DbGuard db(open_db(path));
+    const string sessions = session_table(db.get());
+    const string messages = message_table(db.get());
     // LEFT JOIN: a session whose project row is gone is still listed (with the
     // old INNER JOIN it vanished from the UI and could never be deleted).
+    // The table names are interpolated (not bound) because SQLite cannot bind
+    // identifiers; they come from session_table()/message_table() and are never
+    // user input.
     StmtGuard st = prepare(db.get(),
         "SELECT s.id, s.title, s.time_created, s.time_updated,"
         "       COALESCE(p.name, ''), COALESCE(p.worktree, ''),"
-        "       (SELECT COUNT(*) FROM message WHERE session_id = s.id)"
-        " FROM session s"
+        "       (SELECT COUNT(*) FROM \"" + messages + "\" WHERE session_id = s.id)"
+        " FROM \"" + sessions + "\" s"
         " LEFT JOIN project p ON s.project_id = p.id"
         " ORDER BY s.time_created DESC");
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -632,7 +655,8 @@ std::vector<Snapshot> load_snapshots(const string& path, const string& snap_dir,
         while (sqlite3_step(st) == SQLITE_ROW)
             project_map[col_text(st, 0)] = {col_text(st, 1), col_text(st, 2)};
 
-        StmtGuard st2 = prepare(db.get(), "SELECT DISTINCT project_id FROM session");
+        StmtGuard st2 = prepare(db.get(), "SELECT DISTINCT project_id FROM \"" +
+                                               session_table(db.get()) + "\"");
         while (sqlite3_step(st2) == SQLITE_ROW) active_ids.insert(col_text(st2, 0));
     }
 
@@ -816,7 +840,7 @@ int delete_sessions(const string& path, const std::vector<string>& ids) {
         }
     }
 
-    StmtGuard st = prepare(db.get(), "DELETE FROM session WHERE id = ?");
+    StmtGuard st = prepare(db.get(), "DELETE FROM \"" + session_table(db.get()) + "\" WHERE id = ?");
     int deleted = 0;
     for (auto& id : ids) {
         sqlite3_bind_text(st, 1, id.c_str(), -1, SQLITE_TRANSIENT);
@@ -839,8 +863,18 @@ std::vector<string> cleanup_orphan_diffs(const string& path, const string& diff_
     std::set<string> existing;
     {
         DbGuard db(open_db(path));
-        StmtGuard st = prepare(db.get(), "SELECT id FROM session");
+        // Must follow the table the sessions actually live in. On a v2 database
+        // the v1 `session` table is frozen, so reading it here would make every
+        // session created after the upgrade look like an orphan -- and its
+        // session_diff file would be deleted. Both tables are consulted when
+        // they exist: a diff is only an orphan if *no* session references it.
+        const string live = session_table(db.get());
+        StmtGuard st = prepare(db.get(), "SELECT id FROM \"" + live + "\"");
         while (sqlite3_step(st) == SQLITE_ROW) existing.insert(col_text(st, 0));
+        if (live != "session" && table_present(db.get(), "session")) {
+            StmtGuard old = prepare(db.get(), "SELECT id FROM session");
+            while (sqlite3_step(old) == SQLITE_ROW) existing.insert(col_text(old, 0));
+        }
     }
 
     if (!is_dir(diff_dir)) return removed;

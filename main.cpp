@@ -1587,8 +1587,11 @@ static int run_db_report() {
            wide_to_utf8(format_size(r.file_bytes)).c_str(), (int)r.page_count, (int)r.page_size);
     printf("  free pages    : %s   <- reclaimable by VACUUM\n",
            wide_to_utf8(format_size(r.free_bytes)).c_str());
-    printf("  rows          : session %d, message %d, part %d, event %d\n", (int)r.session_rows,
-           (int)r.message_rows, (int)r.part_rows, (int)r.event_rows);
+    printf("  schema        : opencode %s\n", r.v2_schema ? "v2" : "v1");
+    printf("  rows          : %s %d, %s %d, part %d, event %d\n",
+           r.v2_schema ? "session_v2" : "session", (int)r.session_rows,
+           r.v2_schema ? "session_message" : "message", (int)r.message_rows, (int)r.part_rows,
+           (int)r.event_rows);
     printf("\nlargest tables (%s):\n",
            r.dbstat_available ? "exact, from dbstat" : "estimated from content bytes");
     for (auto& t : r.tables)
@@ -1615,7 +1618,14 @@ static int run_db_report() {
             printf("  %-58s %12s\n", utf8_ellipsize(t.name, 58).c_str(),
                    wide_to_utf8(format_size(t.bytes)).c_str());
     }
-    printf("\nhint: --compact-events reclaims much more (dry run unless you add --yes)\n");
+    if (r.event_rows == 0) {
+        // opencode v2 migrated the event log away; recommending a compaction
+        // here would send the user after something that no longer exists.
+        printf("\nhint: no event log left in this database (opencode v2 migrated it away).\n"
+               "      The free pages above are what it left behind - --vacuum reclaims them.\n");
+    } else {
+        printf("\nhint: --compact-events reclaims much more (dry run unless you add --yes)\n");
+    }
     return 0;
 }
 
@@ -1625,7 +1635,7 @@ static int run_preview(const CliOptions& o) {
         printf("No parts found for %s\n", o.preview_id.c_str());
         return 1;
     }
-    printf("Last %d part(s) of session %s:\n\n", (int)msgs.size(), o.preview_id.c_str());
+    printf("Last %d item(s) of session %s:\n\n", (int)msgs.size(), o.preview_id.c_str());
     for (auto& m : msgs) {
         printf("  [%s] %s\n", m.role.empty() ? m.kind.c_str() : m.role.c_str(),
                wide_to_utf8(format_time(m.time_created)).c_str());
